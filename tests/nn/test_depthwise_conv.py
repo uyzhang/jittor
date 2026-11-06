@@ -140,6 +140,41 @@ class TestDepthwiseConv(unittest.TestCase):
 
     @unittest.skipIf(not _test_capability.check_accelerator('cuda', backend=jt).enabled, "Cuda not found")
     @jt.flag_scope(use_cuda=1, float32_cudnn_precision="highest")
+    def test_backward_matches_generic_grouped_path(self):
+        # The filter-gradient kernel identifies lane 0 with cub::LaneId(),
+        # removed in CCCL 3; 2-D blocks are not lane aligned and a partial
+        # warp must not enter the shuffle reduction. The fast gradients must
+        # stay within float32 noise of the generic grouped convolution.
+        rng = np.random.default_rng(11)
+        for channels, kernel, size, padding, stride in ((3, 3, 12, 1, 1),
+                                                        (2, 11, 16, 5, 1),
+                                                        (4, 5, 14, 0, 2)):
+            x_array = rng.standard_normal((2, channels, size, size)).astype(np.float32)
+            weight_array = rng.random((channels, 1, kernel, kernel)).astype(np.float32)
+            out_size = (size + 2 * padding - kernel) // stride + 1
+            upstream_array = rng.standard_normal(
+                (2, channels, out_size, out_size)).astype(np.float32)
+            results = []
+            for fast_path in (True, False):
+                x = jt.array(x_array)
+                weight = jt.array(weight_array)
+                upstream = jt.array(upstream_array)
+                output = jt.nn.conv2d(x, weight, padding=padding, stride=stride,
+                                      groups=channels, _depthwise_fast_path=fast_path)
+                input_grad, weight_grad = jt.grad((output * upstream).sum(), [x, weight])
+                results.append((output.numpy(), input_grad.numpy(), weight_grad.numpy()))
+            np.testing.assert_allclose(results[0][0], results[1][0], atol=1e-4, rtol=1e-4,
+                                       err_msg="depthwise forward %dx%d" % (kernel, kernel))
+            for name, fast_grad, generic_grad in (
+                    ("input", results[0][1], results[1][1]),
+                    ("filter", results[0][2], results[1][2])):
+                np.testing.assert_allclose(
+                    fast_grad, generic_grad, atol=1e-4, rtol=1e-4,
+                    err_msg="depthwise %s grad, %dx%d kernel, stride %d, padding %d"
+                            % (name, kernel, kernel, stride, padding))
+
+    @unittest.skipIf(not _test_capability.check_accelerator('cuda', backend=jt).enabled, "Cuda not found")
+    @jt.flag_scope(use_cuda=1, float32_cudnn_precision="highest")
     def test_data(self):
         test_img = np.random.random((64,3,224,224)).astype('float32')
         jittor_test_img = jt.array(test_img)
