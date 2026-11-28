@@ -187,6 +187,11 @@ def cumsum(x, dim=None):
     '''
     import jittor as jt
     dim = jt.misc._cumsum_dim(dim, x.ndim)
+    eager_scan = getattr(jt.core, "_cuda_eager_scan", None)
+    if eager_scan is not None:
+        eager = eager_scan(x, dim, False)
+        if eager is not None:
+            return eager
     result = try_dispatch("tensor.cumsum", x, dim)
     if result is not None:
         return result
@@ -227,6 +232,11 @@ def cumprod(x,dim=None):
     dim = jt.misc._cumsum_dim(dim, x.ndim)
     if x.numel() == 0:
         return x.clone()
+    eager_scan = getattr(jt.core, "_cuda_eager_scan", None)
+    if eager_scan is not None:
+        eager = eager_scan(x, dim, True)
+        if eager is not None:
+            return eager
     result = try_dispatch("tensor.cumprod", x, dim)
     if result is not None:
         return result

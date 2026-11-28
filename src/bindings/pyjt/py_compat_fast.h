@@ -205,4 +205,48 @@ PyObject* jt_concat(PyObject* tensors, int64 dim);
 // @pyjt(_jt_setitem)
 PyObject* jt_setitem(PyObject* self, PyObject* index, PyObject* value);
 
+// Direct eager precompiled CUDA float32 fast paths for already-materialized
+// contiguous CUDA tensors under no_grad / stop_grad outside graph capture.
+// Each returns None whenever any guard declines so the caller falls through
+// to the standard lazy/autograd/multi-dtype implementation.
+// @pyjt(_cuda_eager_unary)
+PyObject* cuda_eager_unary(PyObject* x, int op_id, double p0=0.0, double p1=0.0, int flags=0);
+// @pyjt(_cuda_eager_binary)
+PyObject* cuda_eager_binary(PyObject* x, PyObject* y, int op_id);
+// @pyjt(_cuda_eager_var_std)
+PyObject* cuda_eager_var_std(PyObject* x, int dim, double correction, bool keepdim, bool take_sqrt);
+// @pyjt(_cuda_eager_prod)
+PyObject* cuda_eager_prod(PyObject* x, int dim, bool keepdim);
+// @pyjt(_cuda_eager_minmax_dim)
+PyObject* cuda_eager_minmax_dim(PyObject* x, int dim, bool keepdim, bool is_min);
+// @pyjt(_cuda_eager_scan)
+PyObject* cuda_eager_scan(PyObject* x, int dim, bool is_prod);
+// @pyjt(_cuda_eager_cross_entropy)
+PyObject* cuda_eager_cross_entropy(PyObject* x, PyObject* target, PyObject* weight,
+    bool has_ignore, int64 ignore_idx, int red_mode);
+// @pyjt(_cuda_eager_nll_loss)
+PyObject* cuda_eager_nll_loss(PyObject* x, PyObject* target, PyObject* weight,
+    int64 ignore_idx, int red_mode);
+// @pyjt(_cuda_eager_bce_with_logits)
+PyObject* cuda_eager_bce_with_logits(PyObject* x, PyObject* target, int red_mode);
+// @pyjt(_cuda_eager_adaptive_avg_pool2d)
+PyObject* cuda_eager_adaptive_avg_pool2d(PyObject* x, int64 oh, int64 ow);
+// @pyjt(_cuda_eager_avg_pool2d)
+PyObject* cuda_eager_avg_pool2d(PyObject* x, int64 kh, int64 kw, int64 sh, int64 sw,
+    int64 ph, int64 pw, bool ceil_mode, bool count_include_pad);
+// @pyjt(_cuda_eager_avg_pool3d)
+PyObject* cuda_eager_avg_pool3d(PyObject* x, int64 kd, int64 kh, int64 kw,
+    int64 sd, int64 sh, int64 sw, int64 pd, int64 ph, int64 pw,
+    bool ceil_mode, bool count_include_pad);
+// @pyjt(_cuda_eager_grid_sample_2d)
+PyObject* cuda_eager_grid_sample_2d(PyObject* x, PyObject* grid, int mode_id, int pad_id, bool align_corners);
+// @pyjt(_cuda_eager_resize_bilinear)
+PyObject* cuda_eager_resize_bilinear(PyObject* x, int64 oh, int64 ow, bool align_corners, bool tf_mode);
+// @pyjt(_cuda_eager_affine_grid_4d)
+PyObject* cuda_eager_affine_grid_4d(PyObject* theta, int64 n, int64 h, int64 w, bool align_corners);
+// @pyjt(_cuda_eager_triu_tril)
+PyObject* cuda_eager_triu_tril(PyObject* x, int64 diagonal, bool is_lower);
+// @pyjt(_cuda_eager_trace)
+PyObject* cuda_eager_trace(PyObject* x);
+
 } // namespace jittor

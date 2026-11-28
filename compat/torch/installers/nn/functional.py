@@ -7,6 +7,8 @@ import jittor as jt
 from jittor import nn
 from ...types import _dtype_to_str
 
+_CUDA_EAGER_UNARY = getattr(jt.core, "_cuda_eager_unary", None)
+
 def _pixel_shuffle(input, upscale_factor):
     r = upscale_factor
     N, Cr2, H, W = input.shape
@@ -59,6 +61,10 @@ def _rms_norm(input, normalized_shape, weight=None, eps=None):
     return out.cast(name)
 
 def _selu(input, inplace=False):
+    if not inplace and _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(input, 33)
+        if eager is not None:
+            return eager
     _check_activation_input(input, "selu")
     a = 1.6732632423543772848170429916717
     s = 1.0507009873554804934193349852946
@@ -69,6 +75,10 @@ def _selu(input, inplace=False):
 
 
 def _hardtanh(input, min_val=-1.0, max_val=1.0, inplace=False):
+    if not inplace and min_val <= max_val and _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(input, 30, float(min_val), float(max_val))
+        if eager is not None:
+            return eager
     _check_activation_input(input, "hardtanh")
     if min_val > max_val:
         raise ValueError("min_val cannot be greater than max_val")
@@ -350,6 +360,10 @@ def _ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0,
 def _api_F_logsigmoid(input):
     # The piecewise min/abs form has a zero subgradient at x=0. Preference
     # losses start at exactly zero log-ratio and require d/dx logsigmoid(0)=1/2.
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(input, 36)
+        if eager is not None:
+            return eager
     from jittor._runtime.dispatch import try_dispatch
     from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
     fast = try_dispatch("nn.logsigmoid", input)
@@ -368,6 +382,10 @@ def _api_F_tanhshrink(input):
 
 
 def _api_F_celu(input, alpha=1.0, inplace=False):
+    if not inplace and alpha != 0 and _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(input, 32, float(alpha))
+        if eager is not None:
+            return eager
     _check_activation_input(input, "celu")
     if alpha == 0:
         raise RuntimeError("ZeroDivisionError: alpha cannot be 0 for CELU")

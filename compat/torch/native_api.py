@@ -12,6 +12,22 @@ from .fidelity import Fidelity, register_fidelity
 from .amp import _preserve_autocast_arithmetic, _cuda_autocast_fp32_input
 
 _JITTOR_MOD: Any = None
+_CUDA_EAGER_UNARY: Any = None
+_CUDA_EAGER_BINARY: Any = None
+_CUDA_EAGER_PROBED: bool = False
+
+_EAGER_UNARY_OP_IDS = {
+    "exp": 0, "log": 1, "log1p": 2, "log2": 3, "exp2": 4, "expm1": 5,
+    "sqrt": 6, "rsqrt": 7, "reciprocal": 8, "abs": 9, "negative": 10,
+    "neg": 10, "sin": 11, "cos": 12, "tan": 13, "tanh": 14, "sigmoid": 15,
+    "relu": 16, "erf": 17, "floor": 18, "ceil": 19, "round": 20, "trunc": 21,
+    "sign": 22, "deg2rad": 23, "rad2deg": 24, "lgamma": 25, "digamma": 26,
+}
+
+_EAGER_BINARY_OP_IDS = {
+    "pow": 0, "atan2": 1, "arctan2": 1, "maximum": 6, "minimum": 7, "hypot": 8,
+    "logaddexp": 9,
+}
 
 
 _NATIVE_NAMES = (
@@ -54,6 +70,8 @@ class NativeOperation:
     def __init__(self, name):
         self._operation_key = name
         self._is_plain = name not in self._SPECIAL_OPS
+        self._eager_unary_id = _EAGER_UNARY_OP_IDS.get(name, -1)
+        self._eager_binary_id = _EAGER_BINARY_OP_IDS.get(name, -1)
         self.__name__ = self.__qualname__ = name.replace(".", "_")
         self.__module__ = __name__
         self.__doc__ = "Native %s under the active Torch frontend policy." % name
@@ -66,7 +84,24 @@ class NativeOperation:
     _TORCH_DEFAULTS = {"linalg.svd": {"full_matrices": True}}
 
     def __call__(self, *args, **kwargs):
-        global _JITTOR_MOD
+        global _JITTOR_MOD, _CUDA_EAGER_UNARY, _CUDA_EAGER_BINARY, _CUDA_EAGER_PROBED
+        if not kwargs:
+            if not _CUDA_EAGER_PROBED:
+                jittor_mod = _JITTOR_MOD
+                if jittor_mod is None:
+                    import jittor as jittor_mod
+                    _JITTOR_MOD = jittor_mod
+                _CUDA_EAGER_UNARY = getattr(jittor_mod.core, "_cuda_eager_unary", None)
+                _CUDA_EAGER_BINARY = getattr(jittor_mod.core, "_cuda_eager_binary", None)
+                _CUDA_EAGER_PROBED = True
+            if self._eager_unary_id >= 0 and len(args) == 1 and _CUDA_EAGER_UNARY is not None:
+                res = _CUDA_EAGER_UNARY(args[0], self._eager_unary_id)
+                if res is not None:
+                    return res
+            elif self._eager_binary_id >= 0 and len(args) == 2 and _CUDA_EAGER_BINARY is not None:
+                res = _CUDA_EAGER_BINARY(args[0], args[1], self._eager_binary_id)
+                if res is not None:
+                    return res
         jittor_mod = _JITTOR_MOD
         if jittor_mod is None:
             import jittor as jittor_mod

@@ -248,6 +248,11 @@ def _trace_impl(input):
     from . import (
         jt,
     )
+    eager_trace = getattr(jt.core, "_cuda_eager_trace", None)
+    if eager_trace is not None:
+        eager = eager_trace(input)
+        if eager is not None:
+            return eager
     size = min(int(input.shape[0]), int(input.shape[1]))
     if size == 0:
         return input.reshape((-1,))[:0].sum()

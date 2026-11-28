@@ -537,6 +537,11 @@ def triu(input: Var, diagonal:int=0) -> Var:
 
     '''
     import jittor as jt
+    eager_tri = getattr(jt.core, "_cuda_eager_triu_tril", None)
+    if eager_tri is not None:
+        eager = eager_tri(input, int(diagonal), False)
+        if eager is not None:
+            return eager
     result = try_dispatch("tensor.triu", input, diagonal)
     if result is not None:
         return result
@@ -574,6 +579,11 @@ def tril(input: Var, diagonal:int=0) -> Var:
 
     '''
     import jittor as jt
+    eager_tri = getattr(jt.core, "_cuda_eager_triu_tril", None)
+    if eager_tri is not None:
+        eager = eager_tri(input, int(diagonal), True)
+        if eager is not None:
+            return eager
     nd = input.ndim
     if nd >= 2:
         d = int(diagonal)

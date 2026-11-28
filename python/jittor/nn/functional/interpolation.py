@@ -10,6 +10,7 @@ from jittor._runtime.dispatch import dispatch_context, try_dispatch
 from ._layout import channels_last_source, channels_last_view, records_no_grad
 
 _CUDA_RESIZE_LOADED = False
+_CUDA_EAGER_RESIZE_BILINEAR = getattr(jt.core, "_cuda_eager_resize_bilinear", None)
 
 
 def _ensure_cuda_resize():
@@ -257,6 +258,12 @@ def resize(img, size, mode="nearest", align_corners=False, tf_mode=False):
         raise ValueError("unsupported interpolation mode: {}".format(mode))
     if mode == "nearest-exact" and (align_corners or tf_mode):
         raise ValueError("nearest-exact requires align_corners=False and tf_mode=False")
+    if mode == "bilinear" and _CUDA_EAGER_RESIZE_BILINEAR is not None and not (
+        records_no_grad(img) and channels_last_source(img) is not None
+    ):
+        eager = _CUDA_EAGER_RESIZE_BILINEAR(img, int(H), int(W), bool(align_corners), bool(tf_mode))
+        if eager is not None:
+            return eager
     _ensure_cuda_resize()
     fast = try_dispatch("nn.resize", img, (H, W), mode, align_corners, tf_mode)
     if fast is not None:

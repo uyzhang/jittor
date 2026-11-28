@@ -7,6 +7,10 @@ from jittor._runtime.dispatch import dispatch_context, try_dispatch
 from .vector import cosine_similarity
 
 _CUDA_LOSS_KERNELS_LOADED = False
+_CUDA_EAGER_CE = getattr(jt.core, "_cuda_eager_cross_entropy", None)
+_CUDA_EAGER_NLL = getattr(jt.core, "_cuda_eager_nll_loss", None)
+_CUDA_EAGER_BCE_LOGITS = getattr(jt.core, "_cuda_eager_bce_with_logits", None)
+_RED_MODE = {"none": 0, "sum": 1, "mean": 2}
 
 
 def _ensure_cuda_loss_kernels():
@@ -156,6 +160,15 @@ def _checked_class_target(target, classes, ignore_index):
 
 
 def cross_entropy_loss(output, target, weight=None, ignore_index=None,reduction='mean'):
+    if _CUDA_EAGER_CE is not None and reduction in _RED_MODE:
+        eager = _CUDA_EAGER_CE(
+            output, target, weight,
+            ignore_index is not None,
+            int(ignore_index) if ignore_index is not None else 0,
+            _RED_MODE[reduction],
+        )
+        if eager is not None:
+            return eager
     _ensure_cuda_loss_kernels()
     fast = try_dispatch("nn.cross_entropy_loss", output, target, weight=weight,
                         ignore_index=ignore_index, reduction=reduction)
@@ -328,6 +341,10 @@ def nll_loss(output,target,weight=None,ignore_index=-100,reduction='mean'):
         f"nll_loss ignore_index {ignore_index} is out of range for "
         f"{n_classes} classes")
     _check_reduction(reduction)
+    if _CUDA_EAGER_NLL is not None:
+        eager = _CUDA_EAGER_NLL(output, target, weight, int(ignore_index), _RED_MODE[reduction])
+        if eager is not None:
+            return eager
     _ensure_cuda_loss_kernels()
     fast = try_dispatch("nn.nll_loss", output, target, weight=weight,
                         ignore_index=ignore_index, reduction=reduction)
@@ -364,6 +381,10 @@ def binary_cross_entropy_with_logits(output, target, weight=None, pos_weight=Non
 
     eff_reduction = reduction if reduction is not None else ("mean" if size_average else "sum")
     if weight is None and pos_weight is None and eff_reduction in _REDUCTIONS:
+        if _CUDA_EAGER_BCE_LOGITS is not None:
+            eager = _CUDA_EAGER_BCE_LOGITS(output, target, _RED_MODE[eff_reduction])
+            if eager is not None:
+                return eager
         _ensure_cuda_loss_kernels()
         fast = try_dispatch("nn.bce_with_logits", output, target,
                             weight=None, pos_weight=None, reduction=eff_reduction)

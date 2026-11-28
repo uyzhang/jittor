@@ -352,6 +352,13 @@ def _method_prod(self, *a, **k):
     dim = a[0] if len(a) >= 1 else k.get('dim', k.get('axis', None))
     keepdim = a[1] if len(a) >= 2 else bool(k.get('keepdim', k.get('keepdims', False)))
     if isinstance(dim, int) and len(a) <= 2:
+        eager_fn = getattr(jt.core, "_cuda_eager_prod", None)
+        if eager_fn is not None:
+            eager = eager_fn(self, dim, bool(keepdim))
+            if eager is not None:
+                if reduce_dtype is not None and _jittor_dtype_name(eager.dtype) != reduce_dtype:
+                    eager = eager.cast(reduce_dtype)
+                return eager
         from jittor._runtime.dispatch import try_dispatch
         from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
         fast = try_dispatch("math.prod_lastdim", self, dim, bool(keepdim))
