@@ -99,10 +99,12 @@ def compile_backend_sources(config, common_flags):
             # here only because a user-supplied `cc_flags`/`nvcc_flags` can
             # still carry it in.
             flags = remove_flags(flags, ["--use_fast_math", "-Ofast"]) + " -O2 "
-        elif "tier0_cuda" in path:
-            # Precompiled Tier-0 CUDA kernels enforce strict IEEE math parity
-            # with default Tier-1 strict CUDA kernels.
-            flags = remove_flags(flags, ["--use_fast_math", "-Ofast"]) + " --fmad=false --prec-div=true --prec-sqrt=true "
+        elif "tier0_cuda" in path or "fast_ops_cuda" in path:
+            # Precompiled Tier-0 and eager fast CUDA kernels keep strict IEEE
+            # div/sqrt accuracy without --use_fast_math.
+            flags = remove_flags(flags, ["--use_fast_math", "-Ofast"]) + " --prec-div=true --prec-sqrt=true "
+            if "tier0_cuda" in path:
+                flags += " --fmad=false "
         prefix = ""
         if source.language not in ("cuda", "hip"):
             prefix, map_flags_str = ccache_compile_prefix(driver, config.jittor_path)
@@ -1141,6 +1143,8 @@ build_config = BuildConfig(
         BuildSource(os.path.join(backend_root(jittor_path, "cuda"), "runtime/strided_copy.cu"),
                     language="cuda", flags=cuda_sdk_flags),
         BuildSource(os.path.join(backend_root(jittor_path, "cuda"), "runtime/tier0_cuda.cu"),
+                    language="cuda", flags=cuda_sdk_flags),
+        BuildSource(os.path.join(backend_root(jittor_path, "cuda"), "runtime/fast_ops_cuda.cu"),
                     language="cuda", flags=cuda_sdk_flags),
     ) if has_cuda else (),
     backend_link_flags=cuda_link_flags,

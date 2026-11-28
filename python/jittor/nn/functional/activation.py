@@ -102,6 +102,9 @@ def _fused_activation(x, act):
     return None
 
 
+_CUDA_EAGER_UNARY = getattr(jt.core, "_cuda_eager_unary", None)
+
+
 def relu(x, inplace=False):
     r''' Applies the element-wise function:
 
@@ -125,6 +128,10 @@ def relu(x, inplace=False):
     if inplace:
         _arg_policy.ignored("jittor.nn.relu", "inplace", inplace,
                             _INPLACE_CONSEQUENCE)
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 16)
+        if eager is not None:
+            return eager
     # A normalization that can apply the activation in its own last pass
     # (the training batch norm) says so on its unexecuted output.
     fused = _fused_activation(x, "relu")
@@ -168,6 +175,10 @@ def leaky_relu(x, scale=0.01, negative_slope=None, inplace=False):
     if inplace:
         _arg_policy.ignored("jittor.nn.leaky_relu", "inplace", inplace,
                             _INPLACE_CONSEQUENCE)
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 39, float(scale))
+        if eager is not None:
+            return eager
     fast = try_dispatch("nn.leaky_relu", x, scale=scale, inplace=inplace)
     if fast is not None:
         return fast
@@ -215,6 +226,10 @@ def elu(x: jt.Var, alpha: float = 1.0) -> jt.Var:
         >>> nn.elu(a)
         jt.Var([-0.31873488 -0.6782155   2.128115  ], dtype=float32)
     '''
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 31, float(alpha))
+        if eager is not None:
+            return eager
     from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
     fast = try_dispatch("nn.elu", x, alpha=alpha)
     if fast is not None:
@@ -359,6 +374,10 @@ def silu(x, inplace=False):     # inplace: accepted for torch/mmcv compat, ignor
     if inplace:
         _arg_policy.ignored("jittor.nn.silu", "inplace", inplace,
                             _INPLACE_CONSEQUENCE)
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 38)
+        if eager is not None:
+            return eager
     # A normalization that can apply the activation in its own last pass
     # (group norm, see `group_norm_cuda.py`) says so on its unexecuted output.
     fused = _fused_activation(x, "silu")
@@ -412,6 +431,10 @@ def hardswish(x):
         x \\cdot (x + 3) / 6, & \\text{otherwise}
         \\end{cases}
     '''
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 28)
+        if eager is not None:
+            return eager
     return x * jt.clamp(x + 3, min_v=0, max_v=6) / 6
 
 
@@ -425,6 +448,10 @@ def hardsigmoid(x):
         x / 6 + 1/2, & \\text{otherwise}
         \\end{cases}
     '''
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 29)
+        if eager is not None:
+            return eager
     return jt.clamp(x / 6 + 0.5, min_v=0.0, max_v=1.0)
 
 
@@ -454,6 +481,10 @@ def get_init_var_rand(shape, dtype):
 
 
 def softplus(x, beta=1.0, threshold=20.0):
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 34, float(beta), float(threshold))
+        if eager is not None:
+            return eager
     dtype = _jittor_dtype_name(x.dtype)
     if dtype not in ("float16", "bfloat16", "float32", "float64"):
         raise TypeError("softplus requires a real floating input")
@@ -482,6 +513,10 @@ def mish(x, inplace=False):
     if inplace:
         _arg_policy.ignored("jittor.nn.mish", "inplace", inplace,
                             _INPLACE_CONSEQUENCE)
+    if _CUDA_EAGER_UNARY is not None:
+        eager = _CUDA_EAGER_UNARY(x, 35)
+        if eager is not None:
+            return eager
     from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
     fast = try_dispatch("nn.mish", x)
     if fast is not None:

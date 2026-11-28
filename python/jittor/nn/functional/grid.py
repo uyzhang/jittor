@@ -10,6 +10,10 @@ from .interpolation import _interpolate
 from ..._runtime.dispatch import register_kernel, select_kernel
 
 _CUDA_GRID_SAMPLE_LOADED = False
+_CUDA_EAGER_GS2D = getattr(jt.core, "_cuda_eager_grid_sample_2d", None)
+_CUDA_EAGER_AFFINE4D = getattr(jt.core, "_cuda_eager_affine_grid_4d", None)
+_GS_MODE_MAP = {"bilinear": 0, "nearest": 1}
+_GS_PAD_MAP = {"zeros": 0, "border": 1, "reflection": 2}
 
 
 def _ensure_cuda_grid_sample():
@@ -140,6 +144,10 @@ def make_base_grid_5D(theta, N, C, D, H, W, align_corners):
 
 
 def affine_grid_generator_4D(theta, N, C, H, W, align_corners):
+    if _CUDA_EAGER_AFFINE4D is not None:
+        eager = _CUDA_EAGER_AFFINE4D(theta, int(N), int(H), int(W), bool(align_corners))
+        if eager is not None:
+            return eager
     from ..._runtime.dispatch import try_dispatch
     _ensure_cuda_grid_sample()
     fast = try_dispatch("nn.affine_grid_4d", theta, N, C, H, W, align_corners)
@@ -331,6 +339,12 @@ def grid_sample(
     assert padding_mode in ["zeros", "border", "reflection"], (
         f"grid_sample padding_mode must be zeros, border or reflection, got {padding_mode!r}"
     )
+    if _CUDA_EAGER_GS2D is not None:
+        eager = _CUDA_EAGER_GS2D(
+            input, grid, _GS_MODE_MAP[mode], _GS_PAD_MAP[padding_mode], bool(align_corners)
+        )
+        if eager is not None:
+            return eager
     _ensure_cuda_grid_sample()
     kernel = select_kernel("nn.grid_sample", input, grid, mode, padding_mode, align_corners)
     if kernel is not None:

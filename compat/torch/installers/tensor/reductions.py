@@ -1,5 +1,18 @@
 """Torch tensor reductions ownership."""
 
+_CUDA_EAGER_VAR_STD = None
+_CUDA_EAGER_MINMAX = None
+_CUDA_EAGER_RED_PROBED = False
+
+
+def _probe_eager_red():
+    global _CUDA_EAGER_VAR_STD, _CUDA_EAGER_MINMAX, _CUDA_EAGER_RED_PROBED
+    if not _CUDA_EAGER_RED_PROBED:
+        import jittor as jt
+        _CUDA_EAGER_VAR_STD = getattr(jt.core, "_cuda_eager_var_std", None)
+        _CUDA_EAGER_MINMAX = getattr(jt.core, "_cuda_eager_minmax_dim", None)
+        _CUDA_EAGER_RED_PROBED = True
+
 def corrcoef(x, *args, **kwargs):
     """Return a CPU NumPy correlation matrix as a Jittor tensor."""
     from importlib import import_module as _import_module
@@ -127,6 +140,13 @@ def _maxmin(which, x, *args, **kwargs):
         native = _owner._NATIVE_MAX if which == "max" else _owner._NATIVE_MIN
         val = native(x, dim, keepdims=keepdim)
         return _owner._MinMax(val, idx.int64())
+    if isinstance(dim, int):
+        if not _CUDA_EAGER_RED_PROBED:
+            _probe_eager_red()
+        if _CUDA_EAGER_MINMAX is not None:
+            eager = _CUDA_EAGER_MINMAX(x, dim, bool(keepdim), which == "min")
+            if eager is not None:
+                return _owner._MinMax(eager[0], eager[1])
     native_arg = _owner._NATIVE_ARGMAX if which == "max" else _owner._NATIVE_ARGMIN
     try:
         res = native_arg(x, dim, keepdims=keepdim)
@@ -203,9 +223,15 @@ def var(input, dim=None, unbiased=None, keepdim=False, keepdims=None,
     biased = _owner._correction_to_unbiased(unbiased, correction)
     kept = bool(keepdim) or bool(keepdims)
     if isinstance(dim, int):
+        corr_val = (float(correction) if correction is not None else (1.0 if biased else 0.0))
+        if not _CUDA_EAGER_RED_PROBED:
+            _probe_eager_red()
+        if _CUDA_EAGER_VAR_STD is not None:
+            eager = _CUDA_EAGER_VAR_STD(input, dim, corr_val, kept, False)
+            if eager is not None:
+                return eager
         from jittor._runtime.dispatch import try_dispatch
         from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
-        corr_val = (float(correction) if correction is not None else (1.0 if biased else 0.0))
         fast = try_dispatch("math.var_std_lastdim", input, dim, corr_val, kept, False)
         if fast is not None:
             return fast
@@ -225,11 +251,17 @@ def std(input, dim=None, unbiased=None, keepdim=False, keepdims=None,
     _owner = _import_module(__package__)
     eff_dim = axis if axis is not None else dim
     if isinstance(eff_dim, int):
-        from jittor._runtime.dispatch import try_dispatch
-        from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
         biased = _owner._correction_to_unbiased(unbiased, correction)
         kept = bool(keepdim) or bool(keepdims)
         corr_val = (float(correction) if correction is not None else (1.0 if biased else 0.0))
+        if not _CUDA_EAGER_RED_PROBED:
+            _probe_eager_red()
+        if _CUDA_EAGER_VAR_STD is not None:
+            eager = _CUDA_EAGER_VAR_STD(input, eff_dim, corr_val, kept, True)
+            if eager is not None:
+                return eager
+        from jittor._runtime.dispatch import try_dispatch
+        from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
         fast = try_dispatch("math.var_std_lastdim", input, eff_dim, corr_val, kept, True)
         if fast is not None:
             return fast

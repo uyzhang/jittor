@@ -16,6 +16,8 @@
 #include "runtime/dispatch_context.h"
 #include "runtime/graph_capture.h"
 #include "runtime/tensor_placement.h"
+#include "runtime/cuda_fast_ops.h"
+#include "ops/composite/index_bounds.h"
 #include <stdexcept>
 #include <descrobject.h>
 #include <unordered_set>
@@ -1337,6 +1339,33 @@ PyObject* fast_clamp(PyObject* self, PyObject* min_v, PyObject* max_v) {
     if (!is_float && !clamp_int_dtype(dtype)) return not_implemented();
     if (kernel_op_registered("clamp.scalar")) return not_implemented();
 
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    // Eager single-kernel float4 CUDA clamp for materialized float32 tensors
+    if (dtype == ns_float32 && (no_grad || x->is_stop_grad()) && !graph_capture_active()
+            && accelerator_backend_id() == BackendId::Cuda
+            && x->mem_ptr && x->is_finished() && x->allocator && x->allocator->is_cuda()
+            && x->is_contiguous() && x->device_id >= 0) {
+        int cflags = 0;
+        double lo = 0.0, hi = 0.0;
+        bool ok = true;
+        if (min_v != Py_None) {
+            lo = PyFloat_AsDouble(min_v);
+            if (lo == -1.0 && PyErr_Occurred()) { PyErr_Clear(); ok = false; }
+            cflags |= 1;
+        }
+        if (ok && max_v != Py_None) {
+            hi = PyFloat_AsDouble(max_v);
+            if (hi == -1.0 && PyErr_Occurred()) { PyErr_Clear(); ok = false; }
+            cflags |= 2;
+        }
+        if (ok && !std::isnan(lo) && !std::isnan(hi)) {
+            PyObject* eager = cuda_eager_unary(self, (int)FastUnaryOp::Clamp, lo, hi, cflags);
+            if (eager != Py_None) return eager;
+            Py_DECREF(eager);
+        }
+    }
+#endif
+
     PyTensorFrontendScope scope(self, nullptr, 0, false);
     if (!is_float && PyLong_CheckExact(min_v) && PyLong_CheckExact(max_v)) {
         int ordered = PyObject_RichCompareBool(min_v, max_v, Py_LE);
@@ -1946,6 +1975,503 @@ PyObject* fast_permute(PyObject* self, PyObject* axes) {
         order.push_back(value);
     }
     return transpose_by(self, holder, order);
+}
+
+// =========================================================================
+// Direct Eager Precompiled CUDA Float32 Fast Paths
+// =========================================================================
+namespace {
+
+inline bool is_plain_frontend_var(PyObject* obj) {
+    if (!PyObject_TypeCheck(obj, &PyjtVarHolder.ht_type)) return false;
+    PyTypeObject* t = Py_TYPE(obj);
+    return t == &PyjtVarHolder.ht_type
+        || (t->tp_dict && PyDict_GetItemString(t->tp_dict, "_frontend_backend") != nullptr);
+}
+
+#if defined(IS_CUDA) && !defined(IS_COREX)
+
+inline bool can_eager_cuda_var(PyObject* obj, Var*& out_var, int& dev_id, bool check_grad = true) {
+    if (graph_capture_active() || accelerator_backend_id() != BackendId::Cuda) return false;
+    if (!is_plain_frontend_var(obj)) return false;
+    auto* vh = GET_RAW_PTR(VarHolder, obj);
+    if (vh->view) return false;
+    Var* v = vh->var;
+    if (check_grad && !no_grad && !v->is_stop_grad()) return false;
+    if (!v->mem_ptr || !v->is_finished() || !v->allocator || !v->allocator->is_cuda()) return false;
+    if (!v->is_contiguous() || v->device_id < 0 || v->num <= 0) return false;
+    out_var = v;
+    dev_id = v->device_id;
+    return true;
+}
+
+inline void ensure_cuda_dev(int dev_id) {
+    if (dev_id != current_device()) set_current_device(dev_id);
+}
+
+inline VarPtr alloc_cuda_var(const NanoVector& shape, NanoString dtype, int dev_id, bool is_scalar = false) {
+    VarPtr vp(shape, dtype);
+    if (is_scalar) vp->set_flag(VarFlags::_is_scalar, 1);
+    Device dev{BackendId::Cuda, dev_id};
+    Allocator* alloc = get_allocator(dev, false);
+    Allocation buf(alloc, vp->size);
+    vp->mem_ptr = buf.ptr;
+    vp->allocator = buf.allocator;
+    vp->allocation = buf.allocation;
+    buf.ptr = nullptr;
+    buf.allocator = nullptr;
+    buf.allocation = 0;
+    vp->placement = TensorPlacement(dev);
+    vp->device_id = dev_id;
+    vp->set_flag(VarFlags::_stop_fuse, 1);
+    vp->flags.set(NodeFlags::_stop_grad, 1);
+    return vp;
+}
+
+inline int64 pool_out_size_c(int64 size, int64 kernel, int64 stride, int64 pad, bool ceil_mode) {
+    if (!ceil_mode) return (size + 2 * pad - kernel) / stride + 1;
+    int64 out = (size + 2 * pad - kernel + stride - 1) / stride + 1;
+    if ((out - 1) * stride >= size + pad) --out;
+    return out;
+}
+
+#endif
+
+} // namespace
+
+PyObject* cuda_eager_unary(PyObject* x, int op_id, double p0, double p1, int flags) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var(xv->shape, ns_float32, dev_id, xv->shape.size() == 0);
+    cuda_fast_unary_f32(
+        static_cast<FastUnaryOp>(op_id),
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<float*>(out->mem_ptr),
+        xv->num, static_cast<float>(p0), static_cast<float>(p1), flags);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)op_id; (void)p0; (void)p1; (void)flags;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_binary(PyObject* x, PyObject* y, int op_id) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    Var* yv = nullptr;
+    int dev_x = -1, dev_y = -1;
+    if (!can_eager_cuda_var(x, xv, dev_x) || !can_eager_cuda_var(y, yv, dev_y)) return none();
+    if (dev_x != dev_y || xv->dtype() != ns_float32 || yv->dtype() != ns_float32) return none();
+    if (xv->shape != yv->shape) return none();
+    ensure_cuda_dev(dev_x);
+    VarPtr out = alloc_cuda_var(xv->shape, ns_float32, dev_x, xv->shape.size() == 0);
+    cuda_fast_binary_f32(
+        static_cast<FastBinaryOp>(op_id),
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<const float*>(yv->mem_ptr),
+        static_cast<float*>(out->mem_ptr),
+        xv->num);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)y; (void)op_id;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_var_std(PyObject* x, int dim, double correction, bool keepdim, bool take_sqrt) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32) return none();
+    int nd = (int)xv->shape.size();
+    if (nd < 2) return none();
+    if (dim < 0) dim += nd;
+    if (dim != nd - 1) return none();
+    int64 width = xv->shape[nd - 1];
+    if (width < 2 || (double)width <= correction) return none();
+    int64 rows = xv->num / width;
+    NanoVector out_shape;
+    for (int i = 0; i < nd - 1; ++i) out_shape.push_back(xv->shape[i]);
+    if (keepdim) out_shape.push_back(1);
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var(out_shape, ns_float32, dev_id, out_shape.size() == 0);
+    cuda_fast_var_std_lastdim_f32(
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<float*>(out->mem_ptr),
+        rows, width, static_cast<float>(correction), take_sqrt ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)dim; (void)correction; (void)keepdim; (void)take_sqrt;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_prod(PyObject* x, int dim, bool keepdim) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32) return none();
+    int nd = (int)xv->shape.size();
+    if (nd < 2) return none();
+    if (dim < 0) dim += nd;
+    if (dim != nd - 1) return none();
+    int64 width = xv->shape[nd - 1];
+    int64 rows = xv->num / width;
+    if (width < 2 || width > 2048 || rows < 8) return none();
+    NanoVector out_shape;
+    for (int i = 0; i < nd - 1; ++i) out_shape.push_back(xv->shape[i]);
+    if (keepdim) out_shape.push_back(1);
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var(out_shape, ns_float32, dev_id, out_shape.size() == 0);
+    cuda_fast_prod_lastdim_f32(
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<float*>(out->mem_ptr), rows, width);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)dim; (void)keepdim;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_minmax_dim(PyObject* x, int dim, bool keepdim, bool is_min) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32) return none();
+    int nd = (int)xv->shape.size();
+    if (nd < 2) return none();
+    if (dim < 0) dim += nd;
+    if (dim != nd - 1) return none();
+    int64 width = xv->shape[nd - 1];
+    int64 rows = xv->num / width;
+    if (width < 1 || width > 2048 || rows < 8) return none();
+    NanoVector out_shape;
+    for (int i = 0; i < nd - 1; ++i) out_shape.push_back(xv->shape[i]);
+    if (keepdim) out_shape.push_back(1);
+    ensure_cuda_dev(dev_id);
+    VarPtr vals = alloc_cuda_var(out_shape, ns_float32, dev_id, out_shape.size() == 0);
+    VarPtr idxs = alloc_cuda_var(out_shape, ns_int64, dev_id, out_shape.size() == 0);
+    cuda_fast_arg_reduce_lastdim_f32(
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<float*>(vals->mem_ptr),
+        static_cast<int64_t*>(idxs->mem_ptr),
+        rows, width, is_min ? 1 : 0);
+    PyObject* py_val = wrap_like(x, new VarHolder(std::move(vals)));
+    if (!py_val) return nullptr;
+    PyObject* py_idx = wrap_like(x, new VarHolder(std::move(idxs)));
+    if (!py_idx) { Py_DECREF(py_val); return nullptr; }
+    PyObject* tup = PyTuple_New(2);
+    PyTuple_SET_ITEM(tup, 0, py_val);
+    PyTuple_SET_ITEM(tup, 1, py_idx);
+    return tup;
+#else
+    (void)x; (void)dim; (void)keepdim; (void)is_min;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_scan(PyObject* x, int dim, bool is_prod) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32) return none();
+    int nd = (int)xv->shape.size();
+    if (nd == 0) return none();
+    if (dim < 0) dim += nd;
+    if (dim < 0 || dim >= nd) return none();
+    int64 outer = 1, inner = 1;
+    for (int i = 0; i < dim; ++i) outer *= xv->shape[i];
+    int64 dim_size = xv->shape[dim];
+    for (int i = dim + 1; i < nd; ++i) inner *= xv->shape[i];
+    if (dim_size > 2048 || (inner == 1 && outer < 8 && dim_size > 256)) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var(xv->shape, ns_float32, dev_id);
+    cuda_fast_scan_f32(
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<float*>(out->mem_ptr),
+        outer, dim_size, inner, is_prod ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)dim; (void)is_prod;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_cross_entropy(PyObject* x, PyObject* target, PyObject* weight,
+    bool has_ignore, int64 ignore_idx, int red_mode) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    Var* tv = nullptr;
+    int dev_x = -1, dev_t = -1;
+    if (!can_eager_cuda_var(x, xv, dev_x) || !can_eager_cuda_var(target, tv, dev_t, false)) return none();
+    if (dev_x != dev_t || xv->dtype() != ns_float32) return none();
+    if (xv->shape.size() != 2 || tv->shape.size() != 1 || tv->shape[0] != xv->shape[0]) return none();
+    int t_i64 = (tv->dtype() == ns_int64) ? 1 : ((tv->dtype() == ns_int32) ? 0 : -1);
+    if (t_i64 < 0) return none();
+    const float* wp = nullptr;
+    if (weight != Py_None) {
+        Var* wv = nullptr;
+        int dev_w = -1;
+        if (!can_eager_cuda_var(weight, wv, dev_w, false) || dev_w != dev_x
+                || wv->dtype() != ns_float32 || wv->shape.size() != 1 || wv->shape[0] != xv->shape[1])
+            return none();
+        wp = static_cast<const float*>(wv->mem_ptr);
+    }
+    int64 N = xv->shape[0], C = xv->shape[1];
+    ensure_cuda_dev(dev_x);
+    NanoVector out_shape = (red_mode == 0) ? NanoVector{N} : NanoVector{};
+    VarPtr out = alloc_cuda_var(out_shape, ns_float32, dev_x, red_mode != 0);
+    Allocator* talloc = get_allocator(Device{BackendId::Cuda, dev_x}, true);
+    Allocation tmp_l(talloc, red_mode != 0 ? (size_t)N * sizeof(float) : 0);
+    Allocation tmp_w(talloc, red_mode != 0 ? (size_t)N * sizeof(float) : 0);
+    float* tl = red_mode != 0 ? static_cast<float*>(tmp_l.ptr) : nullptr;
+    float* tw = red_mode != 0 ? static_cast<float*>(tmp_w.ptr) : nullptr;
+    cuda_fast_cross_entropy_f32(
+        static_cast<const float*>(xv->mem_ptr), tv->mem_ptr, t_i64, wp,
+        static_cast<float*>(out->mem_ptr), tl, tw,
+        N, C, has_ignore ? 1 : 0, ignore_idx, red_mode, device_index_fault());
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)target; (void)weight; (void)has_ignore; (void)ignore_idx; (void)red_mode;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_nll_loss(PyObject* x, PyObject* target, PyObject* weight,
+    int64 ignore_idx, int red_mode) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    Var* tv = nullptr;
+    int dev_x = -1, dev_t = -1;
+    if (!can_eager_cuda_var(x, xv, dev_x) || !can_eager_cuda_var(target, tv, dev_t, false)) return none();
+    if (dev_x != dev_t || xv->dtype() != ns_float32) return none();
+    if (xv->shape.size() != 2 || tv->shape.size() != 1 || tv->shape[0] != xv->shape[0]) return none();
+    int t_i64 = (tv->dtype() == ns_int64) ? 1 : ((tv->dtype() == ns_int32) ? 0 : -1);
+    if (t_i64 < 0) return none();
+    const float* wp = nullptr;
+    if (weight != Py_None) {
+        Var* wv = nullptr;
+        int dev_w = -1;
+        if (!can_eager_cuda_var(weight, wv, dev_w, false) || dev_w != dev_x
+                || wv->dtype() != ns_float32 || wv->shape.size() != 1 || wv->shape[0] != xv->shape[1])
+            return none();
+        wp = static_cast<const float*>(wv->mem_ptr);
+    }
+    int64 N = xv->shape[0], C = xv->shape[1];
+    ensure_cuda_dev(dev_x);
+    NanoVector out_shape = (red_mode == 0) ? NanoVector{N} : NanoVector{};
+    VarPtr out = alloc_cuda_var(out_shape, ns_float32, dev_x, red_mode != 0);
+    Allocator* talloc = get_allocator(Device{BackendId::Cuda, dev_x}, true);
+    Allocation tmp_l(talloc, red_mode != 0 ? (size_t)N * sizeof(float) : 0);
+    Allocation tmp_w(talloc, red_mode != 0 ? (size_t)N * sizeof(float) : 0);
+    float* tl = red_mode != 0 ? static_cast<float*>(tmp_l.ptr) : nullptr;
+    float* tw = red_mode != 0 ? static_cast<float*>(tmp_w.ptr) : nullptr;
+    cuda_fast_nll_loss_f32(
+        static_cast<const float*>(xv->mem_ptr), tv->mem_ptr, t_i64, wp,
+        static_cast<float*>(out->mem_ptr), tl, tw,
+        N, C, ignore_idx, red_mode, device_index_fault());
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)target; (void)weight; (void)ignore_idx; (void)red_mode;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_bce_with_logits(PyObject* x, PyObject* target, int red_mode) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    Var* tv = nullptr;
+    int dev_x = -1, dev_t = -1;
+    if (!can_eager_cuda_var(x, xv, dev_x) || !can_eager_cuda_var(target, tv, dev_t)) return none();
+    if (dev_x != dev_t || xv->dtype() != ns_float32 || tv->dtype() != ns_float32) return none();
+    if (xv->shape != tv->shape) return none();
+    ensure_cuda_dev(dev_x);
+    NanoVector out_shape = (red_mode == 0) ? xv->shape : NanoVector{};
+    VarPtr out = alloc_cuda_var(out_shape, ns_float32, dev_x, red_mode != 0);
+    int n_blocks = (int)std::min<int64>(std::max<int64>((xv->num + 255) / 256, 1), 256);
+    Allocator* talloc = get_allocator(Device{BackendId::Cuda, dev_x}, true);
+    Allocation tmp_p(talloc, red_mode != 0 ? (size_t)n_blocks * sizeof(float) : 0);
+    float* part = red_mode != 0 ? static_cast<float*>(tmp_p.ptr) : nullptr;
+    cuda_fast_bce_with_logits_f32(
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<const float*>(tv->mem_ptr),
+        static_cast<float*>(out->mem_ptr),
+        part, xv->num, n_blocks, red_mode);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)target; (void)red_mode;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_adaptive_avg_pool2d(PyObject* x, int64 oh, int64 ow) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32 || xv->shape.size() != 4) return none();
+    if (oh <= 0 || ow <= 0) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var({xv->shape[0], xv->shape[1], oh, ow}, ns_float32, dev_id);
+    cuda_fast_adaptive_avg_pool2d_f32(
+        static_cast<const float*>(xv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        xv->shape[0], xv->shape[1], xv->shape[2], xv->shape[3], oh, ow);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)oh; (void)ow;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_avg_pool2d(PyObject* x, int64 kh, int64 kw, int64 sh, int64 sw,
+    int64 ph, int64 pw, bool ceil_mode, bool count_include_pad) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32 || xv->shape.size() != 4) return none();
+    int64 oh = pool_out_size_c(xv->shape[2], kh, sh, ph, ceil_mode);
+    int64 ow = pool_out_size_c(xv->shape[3], kw, sw, pw, ceil_mode);
+    if (oh <= 0 || ow <= 0) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var({xv->shape[0], xv->shape[1], oh, ow}, ns_float32, dev_id);
+    cuda_fast_avg_pool2d_f32(
+        static_cast<const float*>(xv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        xv->shape[0], xv->shape[1], xv->shape[2], xv->shape[3], oh, ow,
+        kh, kw, sh, sw, ph, pw, count_include_pad ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)kh; (void)kw; (void)sh; (void)sw; (void)ph; (void)pw; (void)ceil_mode; (void)count_include_pad;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_avg_pool3d(PyObject* x, int64 kd, int64 kh, int64 kw,
+    int64 sd, int64 sh, int64 sw, int64 pd, int64 ph, int64 pw,
+    bool ceil_mode, bool count_include_pad) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32 || xv->shape.size() != 5) return none();
+    int64 od = pool_out_size_c(xv->shape[2], kd, sd, pd, ceil_mode);
+    int64 oh = pool_out_size_c(xv->shape[3], kh, sh, ph, ceil_mode);
+    int64 ow = pool_out_size_c(xv->shape[4], kw, sw, pw, ceil_mode);
+    if (od <= 0 || oh <= 0 || ow <= 0) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var({xv->shape[0], xv->shape[1], od, oh, ow}, ns_float32, dev_id);
+    cuda_fast_avg_pool3d_f32(
+        static_cast<const float*>(xv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        xv->shape[0], xv->shape[1], xv->shape[2], xv->shape[3], xv->shape[4],
+        od, oh, ow, kd, kh, kw, sd, sh, sw, pd, ph, pw, count_include_pad ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)kd; (void)kh; (void)kw; (void)sd; (void)sh; (void)sw; (void)pd; (void)ph; (void)pw;
+    (void)ceil_mode; (void)count_include_pad;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_grid_sample_2d(PyObject* x, PyObject* grid, int mode_id, int pad_id, bool align_corners) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    Var* gv = nullptr;
+    int dev_x = -1, dev_g = -1;
+    if (!can_eager_cuda_var(x, xv, dev_x) || !can_eager_cuda_var(grid, gv, dev_g)) return none();
+    if (dev_x != dev_g || xv->dtype() != ns_float32 || gv->dtype() != ns_float32) return none();
+    if (xv->shape.size() != 4 || gv->shape.size() != 4 || gv->shape[3] != 2 || xv->shape[0] != gv->shape[0]) return none();
+    ensure_cuda_dev(dev_x);
+    VarPtr out = alloc_cuda_var({xv->shape[0], xv->shape[1], gv->shape[1], gv->shape[2]}, ns_float32, dev_x);
+    cuda_fast_grid_sample_2d_f32(
+        static_cast<const float*>(xv->mem_ptr),
+        static_cast<const float*>(gv->mem_ptr),
+        static_cast<float*>(out->mem_ptr),
+        xv->shape[0], xv->shape[1], xv->shape[2], xv->shape[3],
+        gv->shape[1], gv->shape[2], mode_id, pad_id, align_corners ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)grid; (void)mode_id; (void)pad_id; (void)align_corners;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_resize_bilinear(PyObject* x, int64 oh, int64 ow, bool align_corners, bool tf_mode) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32 || xv->shape.size() != 4) return none();
+    if (oh <= 0 || ow <= 0) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var({xv->shape[0], xv->shape[1], oh, ow}, ns_float32, dev_id);
+    cuda_fast_resize_bilinear_f32(
+        static_cast<const float*>(xv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        xv->shape[0], xv->shape[1], xv->shape[2], xv->shape[3], oh, ow,
+        align_corners ? 1 : 0, tf_mode ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)oh; (void)ow; (void)align_corners; (void)tf_mode;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_affine_grid_4d(PyObject* theta, int64 n, int64 h, int64 w, bool align_corners) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* tv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(theta, tv, dev_id) || tv->dtype() != ns_float32) return none();
+    if (tv->shape.size() != 3 || tv->shape[0] != n || tv->shape[1] != 2 || tv->shape[2] != 3) return none();
+    if (n <= 0 || h <= 0 || w <= 0) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var({n, h, w, 2}, ns_float32, dev_id);
+    cuda_fast_affine_grid_4d_f32(
+        static_cast<const float*>(tv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        n, h, w, align_corners ? 1 : 0);
+    return wrap_like(theta, new VarHolder(std::move(out)));
+#else
+    (void)theta; (void)n; (void)h; (void)w; (void)align_corners;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_triu_tril(PyObject* x, int64 diagonal, bool is_lower) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32) return none();
+    int nd = (int)xv->shape.size();
+    if (nd < 2) return none();
+    int64 rows = xv->shape[nd - 2], cols = xv->shape[nd - 1];
+    int64 batch = xv->num / (rows * cols);
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var(xv->shape, ns_float32, dev_id);
+    cuda_fast_triu_tril_f32(
+        static_cast<const float*>(xv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        batch, rows, cols, diagonal, is_lower ? 1 : 0);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x; (void)diagonal; (void)is_lower;
+    return none();
+#endif
+}
+
+PyObject* cuda_eager_trace(PyObject* x) {
+#if defined(IS_CUDA) && !defined(IS_COREX)
+    Var* xv = nullptr;
+    int dev_id = -1;
+    if (!can_eager_cuda_var(x, xv, dev_id) || xv->dtype() != ns_float32 || xv->shape.size() != 2) return none();
+    int64 rows = xv->shape[0], cols = xv->shape[1];
+    int64 size = rows < cols ? rows : cols;
+    if (size <= 0) return none();
+    ensure_cuda_dev(dev_id);
+    VarPtr out = alloc_cuda_var({}, ns_float32, dev_id, true);
+    cuda_fast_trace_f32(
+        static_cast<const float*>(xv->mem_ptr), static_cast<float*>(out->mem_ptr),
+        size, cols + 1);
+    return wrap_like(x, new VarHolder(std::move(out)));
+#else
+    (void)x;
+    return none();
+#endif
 }
 
 } // namespace jittor

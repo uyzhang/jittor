@@ -17,6 +17,9 @@ from jittor.misc import _pair, _triple
 from jittor._runtime.dispatch import try_dispatch
 
 _CUDA_AVG_POOL_LOADED = False
+_CUDA_EAGER_AAP2D = getattr(jt.core, "_cuda_eager_adaptive_avg_pool2d", None)
+_CUDA_EAGER_AP2D = getattr(jt.core, "_cuda_eager_avg_pool2d", None)
+_CUDA_EAGER_AP3D = getattr(jt.core, "_cuda_eager_avg_pool3d", None)
 
 
 def _ensure_cuda_avg_pool():
@@ -108,12 +111,27 @@ def _avg_pool_nd(x, rank, kernel_size, stride, padding, ceil_mode,
             "kernel {}, stride {}, padding {}.".format(
                 api, tuple(out_sizes), tuple(x.shape), kernel, strides, pads))
     if rank == 2:
+        if _CUDA_EAGER_AP2D is not None:
+            eager = _CUDA_EAGER_AP2D(
+                x, kernel[0], kernel[1], strides[0], strides[1],
+                pads[0], pads[1], bool(ceil_mode), bool(count_include_pad),
+            )
+            if eager is not None:
+                return eager
         _ensure_cuda_avg_pool()
         fast = try_dispatch("nn.pool2d", x, kernel, strides, pads, None, False,
                             ceil_mode, count_include_pad, "mean")
         if fast is not None:
             return fast
     elif rank == 3:
+        if _CUDA_EAGER_AP3D is not None:
+            eager = _CUDA_EAGER_AP3D(
+                x, kernel[0], kernel[1], kernel[2],
+                strides[0], strides[1], strides[2],
+                pads[0], pads[1], pads[2], bool(ceil_mode), bool(count_include_pad),
+            )
+            if eager is not None:
+                return eager
         _ensure_cuda_avg_pool()
         fast = try_dispatch("nn.avg_pool3d", x, kernel, strides, pads,
                             ceil_mode, count_include_pad)
@@ -204,6 +222,10 @@ def adaptive_avg_pool2d(input, output_size):
     if input.ndim == 3:
         return adaptive_avg_pool2d(input.unsqueeze(0), output_size).squeeze(0)
     out_height, out_width = output_size
+    if _CUDA_EAGER_AAP2D is not None:
+        eager = _CUDA_EAGER_AAP2D(input, out_height, out_width)
+        if eager is not None:
+            return eager
     _ensure_cuda_avg_pool()
     dispatched = try_dispatch("nn.adaptive_avg_pool2d", input, output_size)
     if dispatched is not None:

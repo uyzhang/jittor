@@ -318,6 +318,7 @@ include backends/cuda/libraries/cusparse/src/helper_cusparse.cc
 include backends/cuda/libraries/cutt/include/cutt_wrapper.h
 include backends/cuda/libraries/cutt/src/cutt_wrapper.cc
 include backends/cuda/runtime/driver.cc
+include backends/cuda/runtime/fast_ops_cuda.cu
 include backends/cuda/runtime/nan_checker.cc
 include backends/cuda/runtime/strided_copy.cu
 include backends/cuda/runtime/tier0_cuda.cu
@@ -881,6 +882,7 @@ include src/runtime/backends/cuda_streams.h
 include src/runtime/collective_dtype.h
 include src/runtime/configuration.cc
 include src/runtime/configuration.h
+include src/runtime/cuda_fast_ops.h
 include src/runtime/cuda_streams.h
 include src/runtime/device.cc
 include src/runtime/device.h

@@ -1,8 +1,27 @@
 """Torch numerical elementwise operations."""
 
+_CE_UNARY = None
+_CE_BINARY = None
+_CE_PROBED = False
+
+
+def _probe_cuda_eager():
+    global _CE_UNARY, _CE_BINARY, _CE_PROBED
+    if not _CE_PROBED:
+        import jittor as jt
+        _CE_UNARY = getattr(jt.core, "_cuda_eager_unary", None)
+        _CE_BINARY = getattr(jt.core, "_cuda_eager_binary", None)
+        _CE_PROBED = True
+
 
 def exp(input):
     """Preserve Torch's floating output dtype outside explicit autocast."""
+    if not _CE_PROBED:
+        _probe_cuda_eager()
+    if _CE_UNARY is not None:
+        out = _CE_UNARY(input, 0)
+        if out is not None:
+            return out
     import jittor as jt
     from jittor._core.dtypes import dtype_name
     from ...amp import autocast_dtype
@@ -19,6 +38,12 @@ def exp(input):
 
 def pow(input, exponent):
     """Use the Tensor power's weak-scalar and result-type semantics."""
+    if not _CE_PROBED:
+        _probe_cuda_eager()
+    if _CE_BINARY is not None:
+        out = _CE_BINARY(input, exponent, 0)
+        if out is not None:
+            return out
     import jittor as jt
     from ...context import get_install_context
     from ...frontend import tensor_frontend
@@ -35,6 +60,12 @@ def pow(input, exponent):
 
 def log1p(x):
     """Compute ``log(1 + x)`` elementwise."""
+    if not _CE_PROBED:
+        _probe_cuda_eager()
+    if _CE_UNARY is not None:
+        out = _CE_UNARY(x, 2)
+        if out is not None:
+            return out
     from . import (
         jt,
     )
@@ -50,6 +81,12 @@ def log1p(x):
 
 def reciprocal(x):
     """Compute the elementwise multiplicative reciprocal."""
+    if not _CE_PROBED:
+        _probe_cuda_eager()
+    if _CE_UNARY is not None:
+        out = _CE_UNARY(x, 8)
+        if out is not None:
+            return out
     from jittor._runtime.dispatch import try_dispatch
     from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
     fast = try_dispatch("math.reciprocal", x)
