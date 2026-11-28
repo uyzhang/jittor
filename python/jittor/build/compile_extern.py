@@ -33,7 +33,7 @@ register_library_resources("cub", home="")
 # read the real environment instead, and the test would then pass or fail on
 # whatever the session before it happened to export.
 use_mkl = build_flag("use_mkl", True, os.environ)
-use_cutt = build_flag("use_cutt", True, os.environ)
+use_cutt = build_flag("use_cutt", False, os.environ)
 use_nccl = build_flag("use_nccl", True, os.environ)
 use_blas = build_flag("use_blas", True, os.environ)
 
@@ -157,14 +157,15 @@ _mkl_obtainable_answer = None
 
 
 def _mkl_obtainable():
-    """Whether oneDNN can be had at all: given explicitly, built, or buildable.
+    """Whether oneDNN can be had at all: given explicitly, built, or opted-in.
 
-    ``use_mkl`` is on by default, and the default install builds oneDNN from
-    source on first use, which needs cmake. Without cmake (and without an
-    existing build or explicit paths) that build cannot even start, so the
-    library is reported as unavailable -- the CPU products then take the
-    generic kernels -- instead of failing every first CPU matmul. A build that
-    starts and fails still raises; ``JITTOR_NO_BUILD=1`` keeps its own error.
+    ``use_mkl`` is on by default so an installed or previously built oneDNN v3
+    is picked up automatically. Without an existing installation, starting a
+    ~1200-file GitHub download + cmake build during the first CPU matmul/conv
+    hangs interactive runs and fails offline machines; source builds therefore
+    require explicit opt-in via ``JT_AUTO_BUILD_ONEDNN=1`` or
+    ``python -m jittor.build.onednn``. Otherwise CPU products use OpenBLAS and
+    Jittor's built-in kernels cleanly.
     """
     global _mkl_obtainable_answer
     if _mkl_obtainable_answer is None:
@@ -175,6 +176,7 @@ def _mkl_obtainable():
             or _onednn_provider.source_build_available(
                 _mkl_root(), manifest.mkl_asset(), manifest.ONEDNN_VERSION, cc_path))
         if not _mkl_obtainable_answer:
+<<<<<<< HEAD
             # Only emit a prominent warning when the user explicitly requested
             # oneDNN; otherwise log verbosely so ordinary CPU runs without cmake
             # do not force users to set JT_BUILD_USE_MKL=0 to stay quiet.
@@ -185,6 +187,14 @@ def _mkl_obtainable():
                    "and convolution use Jittor's generic kernels. Install cmake, or set "
                    "JT_BUILD_MKL_INCLUDE_PATH/JT_BUILD_MKL_LIB_PATH, to enable oneDNN; "
                    "set JT_BUILD_USE_MKL=0 to disable probing.")
+=======
+            explicit_mkl = build_env("use_mkl", None, os.environ) is not None
+            log_fn = LOG.w if explicit_mkl else LOG.v
+            log_fn("oneDNN v3 is not installed (CPU matmul/conv uses OpenBLAS and "
+                   "built-in kernels). Run `python -m jittor.build.onednn`, set "
+                   "JT_AUTO_BUILD_ONEDNN=1 (requires cmake), or set "
+                   "JT_BUILD_MKL_INCLUDE_PATH/JT_BUILD_MKL_LIB_PATH to enable oneDNN.")
+>>>>>>> 2d9f29816 (build: make extern deps offline-safe, lazy, and complete cuda13 extra)
     return _mkl_obtainable_answer
 
 
@@ -389,10 +399,7 @@ def setup_cuda_extern():
         if "cuda" in cp and \
             "lib" in cp and \
             "jtcuda" not in cp:
-            LOG.w("CUDA related path found in LD_LIBRARY_PATH or PATH, "
-            "This path may cause jittor found the wrong libs, "
-            "please unset LD_LIBRARY_PATH and remove cuda lib path in Path. \n"
-            "Or you can let jittor install cuda for you: `python3.x -m jittor_utils.install_cuda`")
+            LOG.v("CUDA related path found in LD_LIBRARY_PATH or PATH: " + cp)
             break
     LOG.vv("setup cuda extern...")
     cache_path_cuda = os.path.join(cache_path, "cuda")
@@ -425,29 +432,41 @@ def setup_cuda_extern():
         line = traceback.format_exc()
         LOG.w(f"CUDA found but cub is not loaded:\n{line}")
 
-    libs = ["cublas", "cudnn", "curand", "cufft", "cusparse"]
-    # in cuda 11.4, module memory comsumptions:
-    # default context: 259 MB
-    # cublas: 340 MB
-    # cudnn: 340 MB
-    if build_flag("conv_opt", False, os.environ):
-        libs = ["cublas", "curand"]
-    for lib_name in libs:
+    # Core CUDA math/RNG libraries loaded at startup; cufft and cusparse are
+    # loaded lazily on first use (via register_library_loader below) so jobs
+    # that do not call FFT or sparse ops neither compile nor fail on them.
+    eager_libs = ["cublas", "curand"]
+    for lib_name in eager_libs:
         try:
             setup_cuda_lib(lib_name, extra_flags=link_cuda_extern)
         except Exception as e:
-            msg = f"CUDA found but {lib_name} could not be loaded: {e}"
-            if lib_name == "cudnn":
-                msg += ("\nThe cuDNN headers and library were not found. Install "
-                        "them with `pip install nvidia-cudnn-cu12` (included in "
-                        "`pip install jittor[cuda12]`), or follow "
-                        "https://docs.nvidia.com/deeplearning/cudnn/install-guide/index.html. "
-                        "To run without cuDNN, set JT_BUILD_CONV_OPT=1: convolutions "
-                        "then use Jittor's own kernels.")
-            else:
-                msg += (f"\n{lib_name} ships with the CUDA toolkit; check that "
-                        "the toolkit that nvcc belongs to is complete.")
+            msg = (f"CUDA found but {lib_name} could not be loaded: {e}\n"
+                   f"{lib_name} ships with the CUDA toolkit; check that "
+                   "the toolkit that nvcc belongs to is complete (or install "
+                   "`pip install jittor[cuda12]` / `jittor[cuda13]`).")
             raise RuntimeError(msg) from e
+
+    # cuDNN accelerates convolutions, RNNs, and fused attention when present.
+    # If its headers/libraries are simply not installed, degrade gracefully to
+    # Jittor's built-in kernels instead of aborting `import jittor` (no need to
+    # set JT_BUILD_CONV_OPT=1). Build/load failures when cuDNN *is* installed
+    # and BuildNotAllowed policy stops still raise.
+    if not build_flag("conv_opt", False, os.environ):
+        try:
+            setup_cuda_lib("cudnn", extra_flags=link_cuda_extern)
+        except compiler.BuildNotAllowed:
+            raise
+        except RuntimeError as e:
+            if "not found. Searched:" in str(e):
+                LOG.i("CUDA found without cuDNN; convolutions and attention "
+                      "use Jittor's built-in kernels. Install "
+                      "`nvidia-cudnn-cu12` / `nvidia-cudnn-cu13` to enable cuDNN.")
+            else:
+                msg = (f"CUDA found but cudnn could not be loaded: {e}\n"
+                       "Install matching cuDNN wheels (`pip install nvidia-cudnn-cu12` "
+                       "or `nvidia-cudnn-cu13`), or set JT_BUILD_CONV_OPT=1 to "
+                       "disable cuDNN.")
+                raise RuntimeError(msg) from e
 
 def _cuda_library_sources(lib_name):
     root = backend_root(jittor_path, "cuda")
@@ -665,6 +684,12 @@ def install_cutt(root_folder):
         if CUTT_PATH:
             dirname = CUTT_PATH
         else:
+            if not os.path.isfile(fullname) and os.environ.get("JT_AUTO_INSTALL_CUTT", "0") != "1":
+                raise RuntimeError(
+                    "cuTT source archive is not cached locally and automatic "
+                    "download is disabled. Set JT_AUTO_INSTALL_CUTT=1 or "
+                    "CUTT_PATH to build cuTT, or keep JT_BUILD_USE_CUTT=0 to "
+                    "use Jittor's built-in transpose kernel.")
             LOG.i("Downloading cutt...")
             download_url_to_local(url, filename, root_folder, true_md5)
 
@@ -701,7 +726,7 @@ def setup_cutt():
     if not has_cuda or not (is_cuda or has_corex):
         use_cutt = False
         return
-    use_cutt = build_flag("use_cutt", True, os.environ)
+    use_cutt = build_flag("use_cutt", False, os.environ)
     if not use_cutt:
         return
     cutt_include_path = build_env("cutt_include_path", environ=os.environ)
@@ -776,6 +801,12 @@ def install_nccl(root_folder):
         # and that path has to be able to fetch NCCL too.
         if not inside_mpi() and os.environ.get("JT_NCCL_WORLD_SIZE") is None:
             return
+        if os.environ.get("JT_BUILD_NCCL_FROM_SOURCE", "0") != "1":
+            raise RuntimeError(
+                "No NCCL pip wheel or system libnccl was found. Install a "
+                "wheel (`pip install nvidia-nccl-cu12` or `nvidia-nccl-cu13`) "
+                "or system libnccl-dev, or set JT_BUILD_NCCL_FROM_SOURCE=1 "
+                "to download and build NCCL from source.")
         if not os.path.isfile(os.path.join(root_folder, filename)):
             LOG.i("Downloading nccl...")
         download_url_to_local(url, filename, root_folder, true_md5)

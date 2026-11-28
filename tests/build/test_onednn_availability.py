@@ -26,12 +26,24 @@ class TestSourceBuildAvailable(unittest.TestCase):
         self.compiler = __import__("sys").executable
 
     def test_no_cmake_and_no_build_is_unavailable(self):
-        with mock.patch.object(onednn.shutil, "which", return_value=None):
+        with mock.patch.dict(onednn.os.environ, {}, clear=True), \
+             mock.patch.object(onednn.shutil, "which", return_value=None):
             self.assertFalse(onednn.source_build_available(
                 self.root, ASSET, VERSION, self.compiler))
 
-    def test_cmake_makes_it_available(self):
-        with mock.patch.object(onednn.shutil, "which", return_value="/usr/bin/cmake"):
+    def test_cmake_alone_does_not_trigger_unasked_source_build(self):
+        with mock.patch.dict(onednn.os.environ, {}, clear=True), \
+             mock.patch.object(
+                 onednn.shutil, "which",
+                 side_effect=lambda name: "/usr/bin/cmake" if name == "cmake" else name):
+            self.assertFalse(onednn.source_build_available(
+                self.root, ASSET, VERSION, self.compiler))
+
+    def test_cmake_with_opt_in_makes_it_available(self):
+        with mock.patch.dict(onednn.os.environ, {"JT_AUTO_BUILD_ONEDNN": "1"}, clear=True), \
+             mock.patch.object(
+                 onednn.shutil, "which",
+                 side_effect=lambda name: "/usr/bin/cmake" if name == "cmake" else name):
             self.assertTrue(onednn.source_build_available(
                 self.root, ASSET, VERSION, self.compiler))
 

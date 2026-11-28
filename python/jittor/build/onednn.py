@@ -157,22 +157,25 @@ def _source_build(root, asset, version, compiler):
 
 
 def source_build_available(root, asset, version, compiler):
-    """Whether ``install_source`` can produce a library without failing up front.
+    """Whether ``install_source`` can provide oneDNN without an unasked build.
 
-    True when a matching build is already installed, or when one can be made
-    (cmake is on PATH). The build itself can still fail; this only answers
-    whether attempting it is meaningful at all.
+    An already-built matching prefix on disk is always available (no cmake or
+    network needed). Starting a fresh ~1200-file source download and cmake build
+    during a first CPU matmul/conv requires explicit opt-in via
+    ``JT_AUTO_BUILD_ONEDNN=1`` (or running ``python -m jittor.build.onednn``)
+    so offline and interactive sessions never hang on a surprise source build.
     """
-    if shutil.which("cmake") is not None:
-        return True
     prefix, metadata, _, _, _ = _source_build(root, asset, version, compiler)
     marker = prefix / "jittor-build.json"
-    if not marker.is_file() or library_layout(prefix) is None:
+    if marker.is_file() and library_layout(prefix) is not None:
+        try:
+            if json.loads(marker.read_text(encoding="utf-8")) == metadata:
+                return True
+        except ValueError:
+            pass
+    if os.environ.get("JT_AUTO_BUILD_ONEDNN", "0") != "1":
         return False
-    try:
-        return json.loads(marker.read_text(encoding="utf-8")) == metadata
-    except ValueError:
-        return False
+    return shutil.which("cmake") is not None
 
 
 def install_source(root, asset, version, compiler, download, safe_extract, allow_build=True):
@@ -226,3 +229,22 @@ def install_source(root, asset, version, compiler, download, safe_extract, allow
             prefix.rename(root / (prefix.name + ".replaced-" + str(os.getpid())))
         temporary.rename(prefix)
         return str(prefix)
+
+
+if __name__ == "__main__":
+    from . import compiler as _compiler
+    from jittor_utils import manifest as _manifest
+    from jittor_utils.misc import download_url_to_local, safe_tar_extractall
+    import jittor_utils as _jit_utils
+
+    _root = os.path.join(_jit_utils.home(), ".cache", "jittor", "mkl")
+    _prefix = install_source(
+        _root,
+        _manifest.mkl_asset(),
+        _manifest.ONEDNN_VERSION,
+        _compiler.cc_path,
+        download_url_to_local,
+        safe_tar_extractall,
+        allow_build=True,
+    )
+    print("oneDNN v%s installed at %s" % (_manifest.ONEDNN_VERSION, _prefix))

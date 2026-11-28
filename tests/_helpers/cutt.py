@@ -8,24 +8,25 @@ import unittest
 import jittor as jt
 
 from jittor._runtime.backend_libraries import get_library_ops
+from jittor_utils.env_config import build_flag
 
 
 def require_cutt_ops():
-    """Return the cuTT ops module, or skip if this machine cannot build it.
+    """Return the cuTT ops module, or skip if cuTT is disabled or unavailable.
 
     Reading ``compile_extern.cutt_ops`` reports ``None`` on a machine that has
     cuTT: the library is compiled the first time a CUDA transpose asks for it,
-    not during import, so it has to be requested with ``load=True``. Every cuTT
-    test used to read the plain attribute at module scope and skip with "Not
-    use cutt" -- a reason that was never true and that no run could disprove.
+    not during import, so it has to be requested with ``load=True``. cuTT is
+    opt-in by default (``JT_BUILD_USE_CUTT=1`` / ``use_cutt=1``) so standard
+    runs do not download or compile a third-party transpose library.
 
     Call this from ``setUpClass``, not at module scope: collecting a test file
     must not compile a backend.
     """
     if not _test_capability.check_accelerator('cuda', backend=jt).enabled:
         raise unittest.SkipTest("no CUDA on this machine, cuTT cannot be built")
-    if os.environ.get("use_cutt", "1") != "1":
-        raise unittest.SkipTest("cuTT is disabled by use_cutt=0")
+    if not build_flag("use_cutt", False, os.environ):
+        raise unittest.SkipTest("cuTT is disabled (opt-in via JT_BUILD_USE_CUTT=1)")
     ops = get_library_ops("cutt", load=True)
     if ops is None:
         # Only two things can get us here now: CUDA is present and cuTT is
