@@ -121,18 +121,28 @@ def _maxmin(which, x, *args, **kwargs):
         if which == "max":
             return _owner._NATIVE_MAX_METHOD(x)
         return _owner._NATIVE_MIN_METHOD(x)
-    index_of = _owner.argmax if which == "max" else _owner.argmin
-    idx = index_of(x, dim=dim, keepdim=keepdim)
     if getattr(_owner.jt.compiler, "has_acl", 0):
+        index_of = _owner.argmax if which == "max" else _owner.argmin
+        idx = index_of(x, dim=dim, keepdim=keepdim)
         native = _owner._NATIVE_MAX if which == "max" else _owner._NATIVE_MIN
         val = native(x, dim, keepdims=keepdim)
-    elif keepdim:
+        return _owner._MinMax(val, idx.int64())
+    native_arg = _owner._NATIVE_ARGMAX if which == "max" else _owner._NATIVE_ARGMIN
+    try:
+        res = native_arg(x, dim, keepdims=keepdim)
+    except TypeError:
+        res = native_arg(x, dim, keepdim=keepdim)
+    if isinstance(res, (tuple, list)) and len(res) == 2:
+        idx, val = res
+        return _owner._MinMax(val, idx.int64())
+    idx = _owner._reduce_index(res)
+    if keepdim:
         val = _owner._NATIVE_GATHER(x, dim, idx)
     elif x.ndim == 1:
         val = x[idx]
     else:
         val = _owner._NATIVE_GATHER(x, dim, idx.unsqueeze(dim)).squeeze(dim)
-    return _owner._MinMax(val, idx.int64())
+    return _owner._MinMax(val, idx)
 
 
 def max(input, *args, **kwargs):
@@ -174,7 +184,7 @@ def _multidim_var(input, dims, unbiased, keepdim):
     _owner = _import_module(__package__)
     dims = [int(d) % input.ndim for d in dims]
     mean = _owner.jt.mean(input, dims, keepdims=True)
-    out = _owner.jt.sum((input - mean) ** 2, dims=dims, keepdims=keepdim)
+    out = _owner.jt.sum((input - mean).sqr(), dims=dims, keepdims=keepdim)
     count = 1
     for d in dims:
         count *= input.shape[d]
@@ -192,6 +202,13 @@ def var(input, dim=None, unbiased=None, keepdim=False, keepdims=None,
         dim = axis
     biased = _owner._correction_to_unbiased(unbiased, correction)
     kept = bool(keepdim) or bool(keepdims)
+    if isinstance(dim, int):
+        from jittor._runtime.dispatch import try_dispatch
+        from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+        corr_val = (float(correction) if correction is not None else (1.0 if biased else 0.0))
+        fast = try_dispatch("math.var_std_lastdim", input, dim, corr_val, kept, False)
+        if fast is not None:
+            return fast
     if isinstance(dim, (list, tuple)):
         return _owner._multidim_var(input, dim, biased, kept)
     return _owner._NATIVE_VAR_METHOD(input, dim=dim, unbiased=biased, keepdims=kept)
@@ -206,5 +223,15 @@ def std(input, dim=None, unbiased=None, keepdim=False, keepdims=None,
     """
     from importlib import import_module as _import_module
     _owner = _import_module(__package__)
+    eff_dim = axis if axis is not None else dim
+    if isinstance(eff_dim, int):
+        from jittor._runtime.dispatch import try_dispatch
+        from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+        biased = _owner._correction_to_unbiased(unbiased, correction)
+        kept = bool(keepdim) or bool(keepdims)
+        corr_val = (float(correction) if correction is not None else (1.0 if biased else 0.0))
+        fast = try_dispatch("math.var_std_lastdim", input, eff_dim, corr_val, kept, True)
+        if fast is not None:
+            return fast
     return _owner.var(input, dim=dim, unbiased=unbiased, keepdim=keepdim,
                keepdims=keepdims, correction=correction, axis=axis).sqrt()

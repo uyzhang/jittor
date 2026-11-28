@@ -249,8 +249,9 @@ def _trace_impl(input):
         jt,
     )
     size = min(int(input.shape[0]), int(input.shape[1]))
-    diagonal = jt.arange(size)
-    return input[diagonal, diagonal].sum()
+    if size == 0:
+        return input.reshape((-1,))[:0].sum()
+    return input.reindex([size], ["i0", "i0"]).sum()
 
 
 def trace(input):

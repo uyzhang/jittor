@@ -138,6 +138,11 @@ def deg2rad(x):
 
 def arctan2(y,x):
     import jittor as jt
+    from jittor._runtime.dispatch import try_dispatch
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("math.atan2", y, x)
+    if fast is not None:
+        return fast
     x = (x!=0.0).ternary(x, 1e-30)
     angle = (y/x).arctan()
     mask = (x<0)&(y<0)
@@ -352,6 +357,11 @@ def isposinf(x):
 
 def rsqrt(x):
     import jittor as jt
+    from jittor._runtime.dispatch import try_dispatch
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("math.rsqrt", x)
+    if fast is not None:
+        return fast
     return 1/jt.sqrt(x)
 
 
@@ -403,4 +413,9 @@ def iinfo(dtype):
 
 def expm1(x):
     import jittor as jt
+    from jittor._runtime.dispatch import try_dispatch
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("math.expm1", x)
+    if fast is not None:
+        return fast
     return jt.exp(x) - 1

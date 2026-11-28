@@ -50,6 +50,11 @@ def log1p(x):
 
 def reciprocal(x):
     """Compute the elementwise multiplicative reciprocal."""
+    from jittor._runtime.dispatch import try_dispatch
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("math.reciprocal", x)
+    if fast is not None:
+        return fast
     return 1.0 / x
 
 

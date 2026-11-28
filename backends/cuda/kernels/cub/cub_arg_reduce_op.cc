@@ -68,6 +68,11 @@ void CubArgReduceOp::infer_shape() {
 void CubArgReduceOp::jit_prepare(JK& jk) {
     jk << "«Tx:" << x->dtype();
     jk << "«Toffsets:" << offsets->dtype();
+    jk << "«IS_MIN=" << JK::hex(op == ns_minimum ? 1 : 0);
+    jk << "«WARP_ARG=" << JK::hex(
+        x->dtype() == ns_float32 || x->dtype() == ns_float64 ||
+        x->dtype() == ns_int32 || x->dtype() == ns_int64 ||
+        x->dtype() == ns_uint32 || x->dtype() == ns_uint64);
     jk << "«FUNC:";
     if (op==ns_minimum)
         jk << "ArgMin";
@@ -87,6 +92,82 @@ static __global__ void split(cub::KeyValuePair<int, Tx>* a, Tx* key, int* val, i
     }
 }
 
+#if WARP_ARG
+// Direct 1-pass warp-per-segment argmax/argmin: writes indices and values
+// directly without allocating temporary KeyValuePair buffers or a split kernel.
+static __global__ void warp_seg_arg_reduce(
+    const Tx* __restrict__ xp,
+    const Toffsets* __restrict__ offsets,
+    int* __restrict__ yp,
+    Tx* __restrict__ y_keyp,
+    int num_segments
+) {
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const int total_warps = gridDim.x * warps_per_block;
+
+    for (int seg = blockIdx.x * warps_per_block + warp_in_block;
+         seg < num_segments;
+         seg += total_warps) {
+        const int seg_start = (int)offsets[seg];
+        const int seg_end = (int)offsets[seg + 1];
+        const int seg_len = seg_end - seg_start;
+        if (seg_len <= 0) continue;
+
+        bool has_val = false;
+        Tx best_v = Tx(0);
+        int best_i = 0;
+        for (int i = lane; i < seg_len; i += 32) {
+            Tx v = xp[seg_start + i];
+            if (!has_val) {
+                best_v = v;
+                best_i = i;
+                has_val = true;
+            } else {
+                #if IS_MIN
+                bool better = (v < best_v);
+                #else
+                bool better = (v > best_v);
+                #endif
+                if (better) {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+        }
+        // Warp shuffle reduction preserving first-occurrence tie-break (smaller index wins)
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            Tx ov = __shfl_down_sync(0xffffffffu, best_v, d);
+            int oi = __shfl_down_sync(0xffffffffu, best_i, d);
+            int ohas = __shfl_down_sync(0xffffffffu, (int)has_val, d);
+            if (ohas) {
+                if (!has_val) {
+                    best_v = ov;
+                    best_i = oi;
+                    has_val = true;
+                } else {
+                    #if IS_MIN
+                    bool better = (ov < best_v) || (ov == best_v && oi < best_i);
+                    #else
+                    bool better = (ov > best_v) || (ov == best_v && oi < best_i);
+                    #endif
+                    if (better) {
+                        best_v = ov;
+                        best_i = oi;
+                    }
+                }
+            }
+        }
+        if (lane == 0) {
+            yp[seg] = best_i;
+            y_keyp[seg] = best_v;
+        }
+    }
+}
+#endif
+
 void CubArgReduceOp::jit_run() {
     auto* __restrict__ xp = x->ptr<Tx>();
     auto* __restrict__ offsetsp = offsets->ptr<Toffsets>();
@@ -95,6 +176,18 @@ void CubArgReduceOp::jit_run() {
     for (int i = 0; i < x->shape.size() - 1; ++i) {
         num_segments *= x->shape[i];
     }
+    auto* __restrict__ yp = y->ptr<int>();
+    auto* __restrict__ y_keyp = y_key->ptr<Tx>();
+
+    #if WARP_ARG
+    const int last_dim = x->shape.size() ? (int)x->shape[x->shape.size() - 1] : 0;
+    if (num_segments >= 8 && last_dim > 0 && last_dim <= 2048) {
+        const int blocks = std::min((num_segments + 7) / 8, 65535);
+        warp_seg_arg_reduce<<<blocks, 256>>>(xp, offsetsp, yp, y_keyp, num_segments);
+        return;
+    }
+    #endif
+
     size_t allocation_dout;
     cub::KeyValuePair<int, Tx> *d_out = (cub::KeyValuePair<int, Tx> *)runtime_executor().temp_allocator->alloc(sizeof(cub::KeyValuePair<int, Tx>) * num_segments, allocation_dout);
 
@@ -110,8 +203,6 @@ void CubArgReduceOp::jit_run() {
     cub::DeviceSegmentedReduce::@FUNC@@(d_temp_storage, temp_storage_bytes,
         xp, d_out, num_segments, offsetsp, offsetsp + 1);
 
-    auto* __restrict__ yp = y->ptr<int>();
-    auto* __restrict__ y_keyp = y_key->ptr<Tx>();
     split<<<std::max(1,num_segments/1024),1024>>>(d_out, y_keyp, yp, num_segments);
 
     runtime_executor().temp_allocator->free(d_temp_storage, temp_storage_bytes, allocation);
