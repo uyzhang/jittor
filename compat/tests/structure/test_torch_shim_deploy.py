@@ -86,11 +86,15 @@ class TestTorchShimDeploy(unittest.TestCase):
         expected = sorted(
             path.relative_to(stub_root)
             for path in stub_root.rglob("*.py")
-            if path.parent != stub_root and path.is_file() and not path.is_symlink()
+            if path.parent != stub_root
+            and path.is_file()
+            and not path.is_symlink()
+            and path.relative_to(stub_root).parts[0] not in deploy_module.OPTIONAL_STUBS
         )
 
         self.assertIn(Path("flash_attn/flash_attn_interface.py"), expected)
         self.assertFalse((target / "__init__.py").exists())
+        self.assertFalse((target / "torch_xla").exists())
         for relative in expected:
             with self.subTest(relative=str(relative)):
                 deployed = target / relative
@@ -105,6 +109,35 @@ class TestTorchShimDeploy(unittest.TestCase):
             status = deploy_module.main(["--check", "--target", str(target)])
         self.assertEqual(status, 0)
         self.assertIn("all files present and match source", output.getvalue())
+
+    def test_with_xla_opt_in_deploys_and_checks_torch_xla_stub(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        target = Path(temporary_directory.name) / "site-xla"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = deploy_module.main(["--with-xla", "--target", str(target)])
+        self.assertEqual(status, 0)
+        self.assertTrue((target / "torch_xla" / "__init__.py").is_file())
+        self.assertTrue((target / "torch_xla" / "core" / "xla_model.py").is_file())
+
+        # Both plain `--check` (auto-detects deployed torch_xla) and explicit
+        # `--with-xla --check` succeed once deployed.
+        for args in (["--check", "--target", str(target)],
+                     ["--with-xla", "--check", "--target", str(target)]):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(deploy_module.main(args), 0)
+
+        # Asking `--with-xla --check` on a default deployment reports missing files.
+        default_target = self._deployed_target()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                deploy_module.main(["--with-xla", "--check", "--target", str(default_target)]),
+                1,
+            )
+        self.assertIn("torch_xla", out.getvalue())
 
     def test_recursive_plan_handles_nested_stub_packages(self):
         temporary_directory = tempfile.TemporaryDirectory()

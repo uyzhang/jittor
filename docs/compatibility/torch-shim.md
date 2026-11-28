@@ -41,9 +41,16 @@ jittor-torch-shim --check
 
 ## 可选的 torch_xla 模拟层
 
-`jittor-compat` 随包提供一个 `torch_xla` 客户端模拟层，使按 PyTorch/XLA 客户端 API 编写的程序可以运行在 Jittor 上。`jittor-torch-shim` 会像部署其它随包 stub 一样部署它。它不是 XLA：`distributed.xla_multiprocessing.spawn` 按可见 CUDA 设备为每个进程分配一张卡，`core.xla_model` 把设备、序号和 rendezvous 调用映射到 Jittor 的 CUDA/CPU 设备，集合通信通过 rendezvous 目录做文件交换。没有 TPU、没有 XLA 编译、没有 SPMD 分片，也不支持 XLA FSDP。
+`jittor-compat` 随包提供一个 `torch_xla` 客户端模拟层，使按 PyTorch/XLA 客户端 API 编写的程序可以运行在 Jittor 上。由于 `torch_xla` 一旦可导入就会让 Transformers 与 Accelerate 默认进入 XLA 分支（除非显式设置 `USE_TORCH_XLA=0`），`jittor-torch-shim` **默认不部署** `torch_xla` stub，让常规 CUDA/CPU 用户无需设置 `USE_TORCH_XLA=0`。
 
-注意：`torch_xla` 一旦可导入，Transformers 与 Accelerate 默认会按 XLA 环境处理（`USE_TORCH_XLA` 默认为真）。运行原生 Jittor CUDA 任务时，应设置 `USE_TORCH_XLA=0`，或不部署该 stub；否则无关的 Trainer 路径也会进入模拟的 XLA 分支。
+确实需要运行 PyTorch/XLA 客户端程序时，显式带上 `--with-xla` 部署即可：
+
+```bash
+jittor-torch-shim --with-xla
+jittor-torch-shim --with-xla --check
+```
+
+它不是 XLA：`distributed.xla_multiprocessing.spawn` 按可见 CUDA 设备为每个进程分配一张卡，`core.xla_model` 把设备、序号和 rendezvous 调用映射到 Jittor 的 CUDA/CPU 设备，集合通信通过 rendezvous 目录做文件交换。没有 TPU、没有 XLA 编译、没有 SPMD 分片，也不支持 XLA FSDP。若已部署 `--with-xla` 但要跑原生 CUDA 任务，仍需设置 `USE_TORCH_XLA=0`。
 
 启动方式与上游一致，`--num_cores` 不得超过本进程可见的 CUDA 设备数；纯 CPU 主机只支持单进程：
 
