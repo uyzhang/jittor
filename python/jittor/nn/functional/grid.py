@@ -8,7 +8,15 @@ import numpy as np
 
 from .interpolation import _interpolate
 from ..._runtime.dispatch import register_kernel, select_kernel
-from jittor.backends.cuda.kernels.nn import grid_sample_cuda as _cuda_grid_sample_kernels  # noqa: F401
+
+_CUDA_GRID_SAMPLE_LOADED = False
+
+
+def _ensure_cuda_grid_sample():
+    global _CUDA_GRID_SAMPLE_LOADED
+    if not _CUDA_GRID_SAMPLE_LOADED:
+        _CUDA_GRID_SAMPLE_LOADED = True
+        from jittor.backends.cuda.kernels.nn import grid_sample_cuda as _cuda_grid_sample_kernels  # noqa: F401
 
 
 def grid_sample_v0(input, grid, mode="bilinear", padding_mode="zeros"):
@@ -133,6 +141,7 @@ def make_base_grid_5D(theta, N, C, D, H, W, align_corners):
 
 def affine_grid_generator_4D(theta, N, C, H, W, align_corners):
     from ..._runtime.dispatch import try_dispatch
+    _ensure_cuda_grid_sample()
     fast = try_dispatch("nn.affine_grid_4d", theta, N, C, H, W, align_corners)
     if fast is not None:
         return fast
@@ -322,6 +331,7 @@ def grid_sample(
     assert padding_mode in ["zeros", "border", "reflection"], (
         f"grid_sample padding_mode must be zeros, border or reflection, got {padding_mode!r}"
     )
+    _ensure_cuda_grid_sample()
     kernel = select_kernel("nn.grid_sample", input, grid, mode, padding_mode, align_corners)
     if kernel is not None:
         return kernel(input, grid, mode, padding_mode, align_corners)

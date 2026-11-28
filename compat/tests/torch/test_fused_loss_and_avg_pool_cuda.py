@@ -73,6 +73,15 @@ def test_adaptive_and_avg_pool_cuda_cpu_parity():
         np.testing.assert_allclose(yg.cpu().numpy(), yc.numpy(), rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(xg.grad.cpu().numpy(), xc.grad.numpy(), rtol=1e-4, atol=1e-4)
 
+    xc2 = torch.tensor(img2, requires_grad=True)
+    yc2 = F.avg_pool2d(xc2, 3, stride=2, padding=1, count_include_pad=False)
+    yc2.sum().backward()
+    xg2 = torch.tensor(img2, device="cuda", requires_grad=True)
+    yg2 = F.avg_pool2d(xg2, 3, stride=2, padding=1, count_include_pad=False)
+    yg2.sum().backward()
+    np.testing.assert_allclose(yg2.cpu().numpy(), yc2.numpy(), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(xg2.grad.cpu().numpy(), xc2.grad.numpy(), rtol=1e-4, atol=1e-4)
+
     vol3 = rng.randn(2, 4, 7, 8, 9).astype(np.float32)
     xc = torch.tensor(vol3, requires_grad=True)
     yc = F.avg_pool3d(xc, 3, stride=2, padding=1, count_include_pad=False)

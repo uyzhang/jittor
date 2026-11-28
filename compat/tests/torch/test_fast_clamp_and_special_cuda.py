@@ -7,14 +7,10 @@ import torch
 import torch.nn.functional as F
 
 
-def _devices():
-    devs = ["cpu"]
-    if torch.cuda.is_available():
-        devs.append("cuda")
-    return devs
+_DEVICES = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_lgamma_and_digamma_1d_and_2d_parity(device, dtype):
     # Exercise both 1-D (previously launched <<<1, 16>>> on CUDA) and 2-D shapes
@@ -32,7 +28,7 @@ def test_lgamma_and_digamma_1d_and_2d_parity(device, dtype):
     np.testing.assert_allclose(torch.digamma(x2).cpu().numpy(), torch.digamma(x2.cpu()).numpy(), rtol=rtol)
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 def test_signed_pow_f32_and_f64_parity(device):
     for dtype, rtol in ((torch.float32, 1e-5), (torch.float64, 1e-11)):
         base = torch.tensor([-2.0, -3.0, 2.0, 0.5, 4.0], device=device, dtype=dtype)
@@ -41,7 +37,7 @@ def test_signed_pow_f32_and_f64_parity(device):
         np.testing.assert_allclose(torch.pow(base, exp).cpu().numpy(), expected, rtol=rtol)
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 def test_fast_clamp_and_activations_on_torch_tensor(device):
     x = torch.tensor([-4.0, -1.0, 0.25, 2.5, 4.0, float("nan")], device=device, dtype=torch.float32)
     clamped = torch.clamp(x, -1.0, 1.0)

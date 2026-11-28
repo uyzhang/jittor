@@ -6,7 +6,14 @@ from jittor._runtime.dispatch import dispatch_context, try_dispatch
 
 from .vector import cosine_similarity
 
-from jittor.backends.cuda.kernels.nn import loss_cuda as _cuda_loss_kernels  # noqa: F401
+_CUDA_LOSS_KERNELS_LOADED = False
+
+
+def _ensure_cuda_loss_kernels():
+    global _CUDA_LOSS_KERNELS_LOADED
+    if not _CUDA_LOSS_KERNELS_LOADED:
+        _CUDA_LOSS_KERNELS_LOADED = True
+        from jittor.backends.cuda.kernels.nn import loss_cuda as _cuda_loss_kernels  # noqa: F401
 
 #: the reductions every torch loss accepts
 _REDUCTIONS = ("none", "mean", "sum")
@@ -149,6 +156,7 @@ def _checked_class_target(target, classes, ignore_index):
 
 
 def cross_entropy_loss(output, target, weight=None, ignore_index=None,reduction='mean'):
+    _ensure_cuda_loss_kernels()
     fast = try_dispatch("nn.cross_entropy_loss", output, target, weight=weight,
                         ignore_index=ignore_index, reduction=reduction)
     if fast is not None:
@@ -320,6 +328,7 @@ def nll_loss(output,target,weight=None,ignore_index=-100,reduction='mean'):
         f"nll_loss ignore_index {ignore_index} is out of range for "
         f"{n_classes} classes")
     _check_reduction(reduction)
+    _ensure_cuda_loss_kernels()
     fast = try_dispatch("nn.nll_loss", output, target, weight=weight,
                         ignore_index=ignore_index, reduction=reduction)
     if fast is not None:
@@ -355,6 +364,7 @@ def binary_cross_entropy_with_logits(output, target, weight=None, pos_weight=Non
 
     eff_reduction = reduction if reduction is not None else ("mean" if size_average else "sum")
     if weight is None and pos_weight is None and eff_reduction in _REDUCTIONS:
+        _ensure_cuda_loss_kernels()
         fast = try_dispatch("nn.bce_with_logits", output, target,
                             weight=None, pos_weight=None, reduction=eff_reduction)
         if fast is not None:
