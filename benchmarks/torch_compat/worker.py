@@ -398,7 +398,9 @@ def compile_report(torch, runtime, workload):
 
 
 def measure(options, stack, result, sampler=None):
+    import_started = time.perf_counter()
     torch = import_torch(options.runtime, options.device)
+    result["import_ms"] = (time.perf_counter() - import_started) * 1000.0
     result["versions"] = versions(torch, options.runtime)
     result["settings"] = configure(torch, options.device, options.tf32,
                                    options.cudnn_benchmark, options.runtime)
