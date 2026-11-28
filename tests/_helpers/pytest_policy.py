@@ -253,6 +253,7 @@ def pytest_configure(config):
         "network: external network assets",
         "manual: explicit selection required",
         "load_sensitive: requires an idle machine",
+        "xdist_group: group tests on the same pytest-xdist worker when pytest-xdist is installed",
     ):
         config.addinivalue_line("markers", marker)
 

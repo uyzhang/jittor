@@ -111,7 +111,7 @@ jobs:
             --state-root "${RUNNER_TEMP}/maintained-${{ matrix.library }}" --run
       - name: Retain provenance and failures
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: maintained-${{ matrix.library }}-cpu
           retention-days: 7

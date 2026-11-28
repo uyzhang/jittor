@@ -2,6 +2,7 @@ name: CPU
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
   schedule:
     # Nightly, so the full tier keeps running once `smoke` becomes what a pull
@@ -64,9 +65,18 @@ jobs:
             jittor-build-${{ runner.os }}-
       - name: Run the fast CPU tier
         run: python -m nox -s smoke
+      - name: Save the Jittor build cache
+        if: always() && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/jittor-lab/_state/nox/cache
+          key: jittor-build-${{ runner.os }}-${{ hashFiles('src/**', 'backends/**', 'python/jittor/build/**', 'requirements/dev-tools.txt') }}-${{ github.run_id }}
 
   cpu:
     needs: baseline
+    # Pull requests wait for `smoke`; run the 4-hour full tier on push,
+    # nightly schedule, workflow_dispatch, or PRs explicitly labeled `ci:full`.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     name: nox / cpu
     runs-on: ${{ needs.baseline.outputs.host_runner }}
     container:

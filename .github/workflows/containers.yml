@@ -12,6 +12,9 @@ on:
       - "README.md"
       - "setup.py"
       - "python/**"
+      - "src/**"
+      - "backends/**"
+      - "compat/**"
       - "requirements/examples.txt"
       - ".github/ci-baseline.env"
       - ".github/workflows/_ci-baseline.yml"
@@ -19,6 +22,7 @@ on:
   push:
     branches:
       - "2.0"
+      - "2.0-refactor"
       - master
     tags:
       - "v*"

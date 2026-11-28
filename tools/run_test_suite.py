@@ -108,6 +108,13 @@ def _resolve_nvcc():
                   or os.environ.get("nvcc_path") or os.environ.get("NVCC_PATH"))
     if configured and Path(configured).exists():
         return configured
+    nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_root = os.environ.get(env_name, "").strip()
+        if cuda_root:
+            candidate = Path(cuda_root) / "bin" / nvcc_name
+            if candidate.is_file():
+                return str(candidate)
     found = shutil.which("nvcc")
     if found:
         return found
@@ -188,14 +195,16 @@ def _session_environment(session, serial_compile=False, backend="cpu"):
     # goes. ``--serial-compile`` restores the old value for bisecting a compile
     # failure; tests/codegen/test_parallel_compile_attribution.py is why that
     # is a diagnostic convenience and not a correctness measure.
-    environment["use_parallel_op_compiler"] = "0" if serial_compile else "16"
+    environment["JT_USE_PARALLEL_OP_COMPILER"] = "0" if serial_compile else "16"
+    environment.pop("use_parallel_op_compiler", None)
     # Jittor's segfault handler shells out to gdb for a backtrace. That is
     # useful interactively and ruinous in a suite: gdb ptrace-stops the process
     # first, and if gdb itself dies -- on this distribution it crashes into the
     # apport hook -- the process is left stopped forever, so one crashing test
     # hangs the whole session instead of failing it. A crash here should be a
     # reported failure; run the test on its own to get a backtrace.
-    environment.setdefault("gdb_path", "")
+    if "JT_GDB_PATH" not in environment and "gdb_path" not in environment:
+        environment["JT_GDB_PATH"] = ""
     return environment
 
 
