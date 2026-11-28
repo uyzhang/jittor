@@ -175,11 +175,16 @@ def _mkl_obtainable():
             or _onednn_provider.source_build_available(
                 _mkl_root(), manifest.mkl_asset(), manifest.ONEDNN_VERSION, cc_path))
         if not _mkl_obtainable_answer:
-            LOG.w("use_mkl is on, but oneDNN v3 is not installed and cannot be built "
-                  "here: building it requires cmake, which is not on PATH. CPU matmul "
-                  "and convolution use Jittor's generic kernels. Install cmake, or set "
-                  "JT_BUILD_MKL_INCLUDE_PATH/JT_BUILD_MKL_LIB_PATH, to enable oneDNN; "
-                  "set use_mkl=0 to silence this warning.")
+            # Only emit a prominent warning when the user explicitly requested
+            # oneDNN; otherwise log verbosely so ordinary CPU runs without cmake
+            # do not force users to set JT_BUILD_USE_MKL=0 to stay quiet.
+            explicit_mkl = build_env("use_mkl", None, os.environ)
+            log_fn = LOG.w if explicit_mkl is not None else LOG.v
+            log_fn("use_mkl is on, but oneDNN v3 is not installed and cannot be built "
+                   "here: building it requires cmake, which is not on PATH. CPU matmul "
+                   "and convolution use Jittor's generic kernels. Install cmake, or set "
+                   "JT_BUILD_MKL_INCLUDE_PATH/JT_BUILD_MKL_LIB_PATH, to enable oneDNN; "
+                   "set JT_BUILD_USE_MKL=0 to disable probing.")
     return _mkl_obtainable_answer
 
 
@@ -1275,7 +1280,10 @@ def inside_mpi():
 def setup_mpi():
     global use_mpi
     global mpicc_path, has_mpi
-    use_mpi = build_flag("use_mpi", True, os.environ)
+    # Avoid probing/compiling/dlopening libmpi on single-process non-MPI runs
+    # unless the caller explicitly requested JT_BUILD_USE_MPI=1.
+    explicit_mpi = build_env("use_mpi", None, os.environ)
+    use_mpi = build_flag("use_mpi", inside_mpi(), os.environ) if explicit_mpi is None else build_flag("use_mpi", True, os.environ)
     has_mpi = False
     if not use_mpi:
         return

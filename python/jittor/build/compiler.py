@@ -717,8 +717,21 @@ if os.path.isfile(ex_python_path):
 def _discover_cuda_compiler(requested_backend):
     if requested_backend not in (None, "cuda"):
         return ""
+    # Honor explicit JT_BUILD_NVCC_PATH / nvcc_path first (including "" to
+    # force a CPU-only build before probing any cached/system installation).
+    if build_env("nvcc_path", None) is not None:
+        return env_or_try_find("nvcc_path", "nvcc")
     nvcc = None
-    if install_cuda.has_installation() or os.name == 'nt':
+    # Standard CUDA_HOME / CUDA_PATH take precedence just like PyTorch, so
+    # users do not need to duplicate CUDA_HOME into JT_BUILD_NVCC_PATH.
+    nvcc_exe = "nvcc.exe" if os.name == "nt" else "nvcc"
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_root = os.environ.get(env_name, "").strip()
+        if cuda_root:
+            nvcc = try_find_exe(os.path.join(cuda_root, "bin", nvcc_exe))
+            if nvcc:
+                break
+    if not nvcc and (install_cuda.has_installation() or os.name == 'nt'):
         nvcc = install_cuda.install_cuda()
         if nvcc:
             nvcc = try_find_exe(nvcc)
@@ -750,7 +763,7 @@ if nvcc_path:
     v = jit_utils.get_version(nvcc_path)[1:-1]
     nvcc_version = list(map(int,v.split('.')))
     cu += v
-    cuda_wheel_stack = install_cuda.get_cuda_wheel_stack(v)
+    cuda_wheel_stack = install_cuda.get_cuda_wheel_stack(v, nvcc_path=nvcc_path)
     if cuda_wheel_stack:
         cu += "_" + cuda_wheel_stack.fingerprint
     archs = query_cuda_archs()

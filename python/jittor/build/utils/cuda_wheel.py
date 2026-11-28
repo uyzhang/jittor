@@ -427,7 +427,7 @@ CudaWheelReport = collections.namedtuple(
     "CudaWheelReport", "stack reason present broken")
 
 
-def inspect_cuda_wheel_stack(nvcc_version=None, distribution=None):
+def inspect_cuda_wheel_stack(nvcc_version=None, distribution=None, nvcc_path=None):
     """Resolve the selected CUDA 12.2 or 13.0 wheels and explain failures.
 
     Every one of these failures used to be swallowed -- the diagnostic strings
@@ -436,6 +436,11 @@ def inspect_cuda_wheel_stack(nvcc_version=None, distribution=None):
     let something upgrade one wheel, silently got the *system* CUDA instead,
     and found out several minutes later through an unrelated-looking cuDNN 9
     error. The two events had no visible connection.
+
+    When ``nvcc_path`` points to a system or ``CUDA_HOME`` compiler (outside
+    ``site-packages/nvidia/``), an incomplete or version-mismatched pip wheel
+    set is treated as a clean fallback to that system CUDA toolkit rather than
+    a broken wheel install, so users do not need ``JITTOR_CUDA_WHEEL_DISABLE=1``.
 
     ``distribution`` is injectable for unit tests and follows
     ``importlib.metadata.distribution``'s interface.
@@ -452,6 +457,7 @@ def inspect_cuda_wheel_stack(nvcc_version=None, distribution=None):
             None, "jittor CUDA wheels require nvcc 12.2 or 13.0, found %s" % nvcc_version,
             0, False)
 
+    using_system_nvcc = bool(nvcc_path) and not is_nvidia_wheel_path(nvcc_path)
     stack_type = Cuda13WheelStack if family == (13, 0) else CudaWheelStack
     specs = stack_type.component_specs
 
@@ -482,7 +488,8 @@ def inspect_cuda_wheel_stack(nvcc_version=None, distribution=None):
         # Only now, and only on the failure path: the success path must not
         # read any distribution's metadata twice.
         present = _count_installed(distribution, specs)
-        return CudaWheelReport(None, reason, present, family == (13, 0) and present > 0)
+        is_broken = (family == (13, 0) and present > 0 and not using_system_nvcc)
+        return CudaWheelReport(None, reason, present, is_broken)
     stack = stack_type(components, versions)
     try:
         _validate_stack(stack)
