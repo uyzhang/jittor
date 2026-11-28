@@ -30,6 +30,43 @@ _STATE = {
     "pg_map": {},
 }
 _STORE_GROUP_SEQUENCE = 0
+_GLOO_GROUP_SEQUENCE = 0
+
+
+def _gloo_var_all_reduce(self, op="mean"):
+    return _WORLD.all_reduce(self, op=op)
+
+
+def _gloo_var_broadcast(self, root=0):
+    return _WORLD.broadcast(self, src=root)
+
+
+def _gloo_var_all_gather(self):
+    return _WORLD.all_gather(self)
+
+
+_GLOO_PREV_VAR_METHODS = {}
+
+
+def _install_gloo_var_methods():
+    for name, fn in (
+        ("mpi_all_reduce", _gloo_var_all_reduce),
+        ("mpi_broadcast", _gloo_var_broadcast),
+        ("mpi_all_gather", _gloo_var_all_gather),
+    ):
+        if name not in _GLOO_PREV_VAR_METHODS:
+            _GLOO_PREV_VAR_METHODS[name] = getattr(jt.core.Var, name, None)
+        setattr(jt.core.Var, name, fn)
+
+
+def _restore_gloo_var_methods():
+    for name in list(_GLOO_PREV_VAR_METHODS):
+        prev = _GLOO_PREV_VAR_METHODS.pop(name)
+        if prev is None:
+            if hasattr(jt.core.Var, name):
+                delattr(jt.core.Var, name)
+        else:
+            setattr(jt.core.Var, name, prev)
 
 
 def _launcher_group_unique_id(module, ranks):
@@ -259,6 +296,7 @@ class ProcessGroup:
         self.bound_device_id = 0
         self._backend_kind = None
         self._backend_handle = 0 if ranks is None else None
+        self._gloo_comm = None
 
     def _create_backend_communicator(self):
         # A one-member group performs no collective: every entry point
@@ -269,6 +307,24 @@ class ProcessGroup:
         if self.ranks is not None and len(self.ranks) <= 1:
             self._backend_kind = _default_backend_name()
             self._backend_handle = 0
+            return
+        if _STATE.get("backend") == "gloo":
+            global _GLOO_GROUP_SEQUENCE
+            _GLOO_GROUP_SEQUENCE += 1
+            self._backend_kind = "gloo"
+            self._backend_handle = _GLOO_GROUP_SEQUENCE
+            local_rank = self.rank()
+            if local_rank >= 0 and self.size() > 1:
+                from .gloo import GlooCommunicator
+                store = _STATE.get("store")
+                timeout = float(os.environ.get("JT_RENDEZVOUS_TIMEOUT_S", "300"))
+                self._gloo_comm = GlooCommunicator(
+                    store,
+                    rank=local_rank,
+                    world_size=self.size(),
+                    prefix="jittor/gloo/group/{}".format(_GLOO_GROUP_SEQUENCE),
+                    timeout=timeout,
+                )
             return
         compile_extern = jt.compile_extern
         choices = (
@@ -337,6 +393,9 @@ class ProcessGroup:
             return tensor
         backend = self._collective_backend()
         handle = self._collective_handle()
+        if backend == "gloo":
+            from .gloo import gloo_all_reduce
+            return gloo_all_reduce(tensor, self._gloo_comm, operation)
         if backend == "nccl":
             ops = getattr(jt.compile_extern, "nccl_ops", None)
             if ops is None:
@@ -406,6 +465,9 @@ class ProcessGroup:
                 "broadcast source rank is outside the process group") from error
         backend = self._collective_backend()
         handle = self._collective_handle()
+        if backend == "gloo":
+            from .gloo import gloo_broadcast
+            return gloo_broadcast(tensor, self._gloo_comm, root=root)
         if backend == "nccl":
             ops = getattr(jt.compile_extern, "nccl_ops", None)
             if ops is None:
@@ -438,6 +500,9 @@ class ProcessGroup:
             raise ValueError("all_gather requires a tensor with at least one dimension")
         backend = self._collective_backend()
         handle = self._collective_handle()
+        if backend == "gloo":
+            from .gloo import gloo_all_gather
+            return gloo_all_gather(tensor, self._gloo_comm)
         if backend == "nccl":
             ops = getattr(jt.compile_extern, "nccl_ops", None)
             gather = getattr(ops, "nccl_all_gather", None)
@@ -469,6 +534,9 @@ class ProcessGroup:
                 "reduce_scatter expects dim0 divisible by process-group size")
         backend = self._collective_backend()
         handle = self._collective_handle()
+        if backend == "gloo":
+            from .gloo import gloo_reduce_scatter
+            return gloo_reduce_scatter(tensor, self._gloo_comm)
         if backend == "nccl":
             ops = getattr(jt.compile_extern, "nccl_ops", None)
             scatter = getattr(ops, "nccl_reduce_scatter", None)
@@ -583,6 +651,12 @@ class ProcessGroup:
         peer and per-direction issue order, and ``tag`` is accepted but not
         transmitted. The call returns once the transfer has completed.
         """
+        if self._collective_backend() == "gloo":
+            if not is_initialized():
+                raise _jittor_error()("distributed process group is not initialized")
+            peer = self._p2p_peer(dst)
+            self._gloo_comm.send_var(tensor, peer, tag=int(tag))
+            return None
         _, module = self._p2p_module()
         self._require_p2p_tensor(tensor)
         peer = self._p2p_peer(dst)
@@ -598,6 +672,13 @@ class ProcessGroup:
         transfer lands in a fresh buffer first and is copied into ``tensor``
         once it has completed.
         """
+        if self._collective_backend() == "gloo":
+            if not is_initialized():
+                raise _jittor_error()("distributed process group is not initialized")
+            peer = self._p2p_peer(src)
+            received = self._gloo_comm.recv_var(tensor, peer, tag=int(tag))
+            self._p2p_copy_into(tensor, received)
+            return None
         _, module = self._p2p_module()
         self._require_p2p_tensor(tensor)
         peer = self._p2p_peer(src)
@@ -609,6 +690,9 @@ class ProcessGroup:
 
     def isend(self, tensor, dst=0, tag=0):
         """Flush a send and return a ``P2PWork``; ``wait`` waits for it."""
+        if self._collective_backend() == "gloo":
+            self.send(tensor, dst=dst, tag=tag)
+            return P2PWork()
         _, module = self._p2p_module()
         self._require_p2p_tensor(tensor)
         peer = self._p2p_peer(dst)
@@ -618,6 +702,9 @@ class ProcessGroup:
 
     def irecv(self, tensor, src=0, tag=0):
         """Flush a receive; ``wait`` waits and fills ``tensor``."""
+        if self._collective_backend() == "gloo":
+            self.recv(tensor, src=src, tag=tag)
+            return P2PWork()
         _, module = self._p2p_module()
         self._require_p2p_tensor(tensor)
         peer = self._p2p_peer(src)
@@ -644,6 +731,49 @@ class ProcessGroup:
         ops = list(ops)
         if not ops:
             return []
+        if self._collective_backend() == "gloo":
+            if not is_initialized():
+                raise _jittor_error()("distributed process group is not initialized")
+            import threading
+            entries = [
+                (is_send, tensor, self._p2p_peer(peer), int(tag))
+                for is_send, tensor, peer, tag in ops
+            ]
+            # Run sends concurrently with receives so bidirectional transfers
+            # never deadlock on TCP socket buffers.
+            errors = []
+            received_pairs = []
+            threads = []
+            for is_send, tensor, local, tag in entries:
+                if is_send:
+                    arr = tensor.clone()
+                    arr.sync()
+                    def _do_send(v=arr, p=local, t=tag):
+                        try:
+                            self._gloo_comm.send_var(v, p, tag=t)
+                        except BaseException as exc:
+                            errors.append(exc)
+                    th = threading.Thread(target=_do_send, daemon=True)
+                    th.start()
+                    threads.append(th)
+                else:
+                    box = [None]
+                    received_pairs.append((tensor, box))
+                    def _do_recv(v=tensor, p=local, t=tag, out=box):
+                        try:
+                            out[0] = self._gloo_comm.recv_var(v, p, tag=t)
+                        except BaseException as exc:
+                            errors.append(exc)
+                    th = threading.Thread(target=_do_recv, daemon=True)
+                    th.start()
+                    threads.append(th)
+            for th in threads:
+                th.join()
+            if errors:
+                raise errors[0]
+            for destination, box in received_pairs:
+                self._p2p_copy_into(destination, box[0])
+            return [P2PWork() for _ in ops]
         _, module = self._p2p_module()
         # Validate and flush the operands before the group opens: a producer
         # executed inside the scope would be submitted as part of the NCCL
@@ -674,6 +804,9 @@ class ProcessGroup:
 
     def barrier(self):
         if self.rank() < 0 or self.size() <= 1:
+            return None
+        if self._collective_backend() == "gloo" and self._gloo_comm is not None:
+            self._gloo_comm.barrier()
             return None
         marker = jt.array([self.rank()], dtype="int32")
         self.all_reduce(marker, "sum").sync(device_sync=True)
@@ -756,11 +889,18 @@ def _backend_matches(requested, active):
     active = str(active).strip().lower()
     if requested == active:
         return True
-    device = {"nccl": "cuda", "hccl": "npu", "mpi": "cpu"}.get(active)
+    device = {"nccl": "cuda", "hccl": "npu", "mpi": "cpu", "gloo": "cpu"}.get(active)
     if not device:
         return False
     return any(item.strip() == "{}:{}".format(device, active)
                for item in requested.split(","))
+
+
+def _is_gloo_request(backend_name):
+    if backend_name is None:
+        return False
+    tokens = [item.strip() for item in str(backend_name).lower().split(",")]
+    return "gloo" in tokens or "cpu:gloo" in tokens
 
 
 def init_process_group(backend=None, init_method=None, timeout=None,
@@ -768,13 +908,15 @@ def init_process_group(backend=None, init_method=None, timeout=None,
     """Register the active native communicator as the default WORLD group.
 
     Backend initialization itself remains owned by the launcher/bootstrap and
-    ``compile_extern``. This function validates that communicator and publishes
-    its state through one native owner.
+    ``compile_extern`` for NCCL/HCCL/MPI, and by Jittor's native TCP ``gloo``
+    communicator for MPI-free CPU distributed runs.
     """
     if _STATE["initialized"] and not _STATE["destroyed"]:
         raise _jittor_error()("distributed process group is already initialized")
     if store is not None and init_method is not None:
         raise ValueError("init_process_group accepts store or init_method, not both")
+    backend_name = str(backend).lower() if backend is not None else None
+    gloo_requested = _is_gloo_request(backend_name)
     if init_method is not None:
         from .store import rendezvous
         store, requested_rank, requested_world = next(rendezvous(
@@ -791,14 +933,60 @@ def init_process_group(backend=None, init_method=None, timeout=None,
     if not 0 <= requested_rank < requested_world:
         raise ValueError("rank {} is outside world size {}".format(
             requested_rank, requested_world))
+
+    # Native MPI-free TCP CPU backend ("gloo"): works with zero MPI/NCCL/HCCL.
+    if gloo_requested:
+        if requested_world > 1 and store is None:
+            from .store import rendezvous
+            store, requested_rank, requested_world = next(rendezvous(
+                "env://", rank=requested_rank, world_size=requested_world,
+                timeout=timeout))
+        gloo_comm = None
+        if requested_world > 1:
+            from .gloo import GlooCommunicator
+            from .store import _timeout_seconds
+            gloo_comm = GlooCommunicator(
+                store,
+                rank=requested_rank,
+                world_size=requested_world,
+                prefix="jittor/gloo/world",
+                timeout=_timeout_seconds(timeout),
+            )
+            jt.compile_extern.rank = requested_rank
+            jt.compile_extern.world_size = requested_world
+            jt.compile_extern.in_mpi = True
+            _install_gloo_var_methods()
+        _WORLD._backend_kind = "gloo"
+        _WORLD._backend_handle = 0
+        _WORLD._gloo_comm = gloo_comm
+        local_rank = int(os.environ.get("LOCAL_RANK", requested_rank))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", requested_world))
+        if local_world_size < 1 or not 0 <= local_rank < local_world_size:
+            raise ValueError("invalid local rank/world-size configuration")
+        _STATE.update({
+            "initialized": True,
+            "destroyed": False,
+            "backend": "gloo",
+            "rank": requested_rank,
+            "world_size": requested_world,
+            "local_rank": local_rank,
+            "local_world_size": local_world_size,
+            "store": store,
+            "device": (jt.current_device() if callable(
+                getattr(jt, "current_device", None)) else None),
+        })
+        _STATE["pg_map"][_WORLD] = ("gloo",)
+        return None
+
     if requested_world > 1 and not _runtime_distributed():
         raise _jittor_error()(
-            "multi-rank initialization requires an active Jittor MPI, NCCL, "
-            "or HCCL communicator; refusing to fall back to a singleton")
+            "multi-rank initialization requires an active Jittor Gloo, MPI, "
+            "NCCL, or HCCL communicator; refusing to fall back to a singleton")
     active_backend = _runtime_backend()
-    backend_name = str(backend).lower() if backend is not None else active_backend
+    if backend_name is None:
+        backend_name = active_backend
     if backend_name is None and requested_world == 1:
-        backend_name = "mpi"
+        backend_name = "gloo"
     if requested_world > 1:
         if active_backend is None:
             raise _jittor_error()(
@@ -853,15 +1041,32 @@ def init_process_group(backend=None, init_method=None, timeout=None,
 
 
 def destroy_process_group(group=None):
-    """Release Python registration and close its Store.
+    """Release Python registration, close Gloo TCP sockets, and close Store.
 
     NCCL/HCCL communicator destruction remains process-owned: the current
     backend wrappers expose teardown only through their process finalizer.
     They are released when the worker exits, not by this function.
     """
     if group is not None and group is not _WORLD:
+        comm = getattr(group, "_gloo_comm", None)
+        if comm is not None:
+            comm.close()
+            group._gloo_comm = None
         _STATE["pg_map"].pop(group, None)
         return None
+    was_gloo = _STATE.get("backend") == "gloo"
+    for pg in list(_STATE["pg_map"]):
+        comm = getattr(pg, "_gloo_comm", None)
+        if comm is not None:
+            comm.close()
+            pg._gloo_comm = None
+    _WORLD._backend_kind = None
+    _WORLD._gloo_comm = None
+    if was_gloo:
+        _restore_gloo_var_methods()
+        jt.compile_extern.rank = 0
+        jt.compile_extern.world_size = 1
+        jt.compile_extern.in_mpi = False
     store = _STATE.get("store")
     close = getattr(store, "close", None)
     if callable(close):
@@ -895,7 +1100,8 @@ def _optimizer_legacy_collectives():
     callers observe the same public collective instrumentation.
     """
     native = bool(jt.compile_extern._jt_nccl_no_mpi
-                  or jt.compile_extern._jt_hccl_no_mpi)
+                  or jt.compile_extern._jt_hccl_no_mpi
+                  or _STATE.get("backend") == "gloo")
     if native:
         from jittor import distributed
         return (lambda value: distributed.all_reduce(value, op="mean"),

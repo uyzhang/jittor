@@ -41,10 +41,14 @@ def _parse_device_ids(value, option_name="device ids"):
 
 
 def _device_env_name(backend):
+    if backend == "gloo":
+        return None
     return "CUDA_VISIBLE_DEVICES" if backend == "nccl" else "ASCEND_RT_VISIBLE_DEVICES"
 
 
 def _visible_device_ids(backend, explicit_ids):
+    if backend == "gloo":
+        return []
     env_name = _device_env_name(backend)
     if explicit_ids is not None:
         devices = _parse_device_ids(explicit_ids, "--device-ids")
@@ -73,9 +77,11 @@ def _detect_backend():
         return "hccl"
     if requested == "cuda":
         return "nccl"
-    if requested in ("cpu", "rocm", "hip", "corex"):
+    if requested == "cpu":
+        return "gloo"
+    if requested in ("rocm", "hip", "corex"):
         raise ValueError(
-            "backend {!r} is not supported by jtrun; choose nccl or hccl".format(
+            "backend {!r} is not supported by jtrun; choose nccl, hccl, or gloo".format(
                 requested)
         )
     if requested:
@@ -88,8 +94,9 @@ def _detect_backend():
     if os.path.isfile(ccec):
         return "hccl"
     # Our tree's reliable signal is the built backend itself: import jittor and
-    # ask jittor.compiler.has_acl. The env/file hints above stay the fast path
-    # and the answer for when jittor cannot be imported from the launcher.
+    # ask jittor.compiler.has_acl / has_cuda. The env/file hints above stay the
+    # fast path and the answer for when jittor cannot be imported from the
+    # launcher.
     try:
         import jittor
     except Exception as error:
@@ -97,7 +104,11 @@ def _detect_backend():
               "({}: {}); assuming nccl. Pass --backend to choose.".format(
                   type(error).__name__, error), file=sys.stderr)
         return "nccl"
-    return "hccl" if getattr(jittor.compiler, "has_acl", 0) else "nccl"
+    if getattr(jittor.compiler, "has_acl", 0):
+        return "hccl"
+    if getattr(jittor, "has_cuda", False) and int(jittor.get_device_count()) > 0:
+        return "nccl"
+    return "gloo"
 
 
 def _find_free_port(address):
@@ -207,7 +218,7 @@ def _build_parser():
     parser.add_argument('--nnodes', type=int, default=1, help='fixed number of node agents')
     parser.add_argument('--node-rank', type=int, default=0, help='this node agent rank')
     parser.add_argument('--rdzv-id', help='shared job identity for a multi-node launch')
-    parser.add_argument("--backend", choices=["nccl", "hccl", "auto"], default="auto")
+    parser.add_argument("--backend", choices=["nccl", "hccl", "gloo", "auto"], default="auto")
     parser.add_argument(
         "--standalone", action="store_true",
         help="use a local rendezvous address (the launcher is single-node by default)",
@@ -260,10 +271,11 @@ def _parse_args(argv=None):
 
 
 def _rank_environment(args, rank, backend, devices, rootinfo, master_addr, master_port):
-    prefix = "JT_HCCL" if backend == "hccl" else "JT_NCCL"
     env = dict(os.environ)
     backend_local_rank = rank
-    if backend == "nccl":
+    if backend == "gloo":
+        device = "cpu"
+    elif backend == "nccl":
         device = _visible_devices_for_rank(rank, devices)
         if device is not None and not getattr(args, "keep_visible_devices", False):
             env["CUDA_VISIBLE_DEVICES"] = device
@@ -293,12 +305,16 @@ def _rank_environment(args, rank, backend, devices, rootinfo, master_addr, maste
         "MASTER_PORT": str(master_port),
         "JT_RENDEZVOUS_TIMEOUT_S": str(args.timeout),
         "JITTOR_DIST_RENDEZVOUS_DIR": os.path.abspath(args.logdir),
-        "{}_WORLD_SIZE".format(prefix): str(world),
-        "{}_RANK".format(prefix): str(global_rank),
-        "{}_LOCAL_WORLD_SIZE".format(prefix): str(args.nproc),
-        "{}_LOCAL_RANK".format(prefix): str(backend_local_rank),
-        "{}_ROOTINFO_FILE".format(prefix): rootinfo,
     })
+    if backend != "gloo":
+        prefix = "JT_HCCL" if backend == "hccl" else "JT_NCCL"
+        env.update({
+            "{}_WORLD_SIZE".format(prefix): str(world),
+            "{}_RANK".format(prefix): str(global_rank),
+            "{}_LOCAL_WORLD_SIZE".format(prefix): str(args.nproc),
+            "{}_LOCAL_RANK".format(prefix): str(backend_local_rank),
+            "{}_ROOTINFO_FILE".format(prefix): rootinfo,
+        })
     for name in ('JITTOR_LAUNCHER_EXTERNAL_STORE', 'JITTOR_LAUNCHER_RUN_ID', 'JT_NCCL_LOCAL_WORLD_RANKS'):
         env.pop(name, None)
     if nodes > 1:

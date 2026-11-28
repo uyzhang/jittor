@@ -1009,7 +1009,36 @@ def _init_nccl_from_store(nccl_module, store=None):
 # Looked for in this order, and only reached when the env vars and the wheels
 # have not already answered, so it cannot override an explicit choice.
 def find_system_nccl():
-    """Locate an installed NCCL, or None. Returns (include_dir, lib_dir, lib)."""
+    """Locate an installed NCCL (pip wheel or system), or None.
+
+    Returns ``(include_dir, lib_dir, lib)``.
+    """
+    # Check active Python environment's nvidia-nccl wheel (e.g. nvidia-nccl-cu13
+    # or nvidia-nccl-cu12 installed alongside a system/CUDA_HOME nvcc).
+    import site
+    wheel_roots = []
+    for base in list(dict.fromkeys(
+        list(site.getsitepackages() if hasattr(site, "getsitepackages") else [])
+        + ([site.getusersitepackages()] if hasattr(site, "getusersitepackages") else [])
+        + list(sys.path)
+    )):
+        if not base or not os.path.isdir(base):
+            continue
+        candidate_root = os.path.join(base, "nvidia", "nccl")
+        if os.path.isdir(candidate_root):
+            wheel_roots.append(candidate_root)
+    for root in wheel_roots:
+        inc = os.path.join(root, "include")
+        lib_dir = os.path.join(root, "lib")
+        if os.path.isfile(os.path.join(inc, "nccl.h")) and os.path.isdir(lib_dir):
+            for name in ("libnccl.so.2", "libnccl.so"):
+                candidate = os.path.join(lib_dir, name)
+                if os.path.isfile(candidate):
+                    return inc, lib_dir, candidate
+            matches = sorted(glob.glob(os.path.join(lib_dir, "libnccl.so.*")))
+            if matches:
+                return inc, lib_dir, matches[0]
+
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or ""
     include_dirs = [
         os.path.join(cuda_home, "include") if cuda_home else None,
@@ -1129,21 +1158,19 @@ def setup_nccl(store=None):
         ctypes.CDLL(nccl_lib_name, dlopen_flags)
 
     nccl_src_dir = os.path.join(backend_root(jittor_path, "comm"), "nccl")
+    # Launcher metadata (for example SLURM_NTASKS) does not imply MPI was
+    # built. A disabled/unavailable MPI backend must use the MPI-free recipe,
+    # omitting nccl_mpi_bootstrap.cc so no MPI headers are ever required.
+    _nccl_no_mpi = _nccl_envfile and (not has_mpi or not inside_mpi())
     nccl_src_files = []
     for r, _, f in os.walk(nccl_src_dir):
         for fname in f:
+            if _nccl_no_mpi and fname == "nccl_mpi_bootstrap.cc":
+                continue
             nccl_src_files.append(os.path.join(r, fname))
 
-    # no MPI -> compile out the MPI_Bcast bootstrap. jittor's include scanner is
-    # not #ifdef-aware, so it still must LOCATE mpi_wrapper.h (in the compiled-out
-    # #else) and the <mpi.h> it includes; add their dirs + a stub mpi.h WITHOUT
-    # any libmpi link, so no MPI install is required (#15).
-    # Launcher metadata (for example SLURM_NTASKS) does not imply MPI was
-    # built. A disabled/unavailable MPI backend must use the no-MPI recipe.
-    if _nccl_envfile and (not has_mpi or not inside_mpi()):
-        _mpi_inc = os.path.join(backend_root(jittor_path, "comm"), "mpi", "inc")
-        _stub_inc = os.path.join(backend_root(jittor_path, "comm"), "nccl", "nompi_inc")
-        _mpi_flags = f' -DJT_NCCL_NO_MPI -I"{_mpi_inc}" -I"{_stub_inc}" '
+    if _nccl_no_mpi:
+        _mpi_flags = " -DJT_NCCL_NO_MPI "
     else:
         _mpi_flags = mpi_compile_flags
     nccl = compile_custom_ops(nccl_src_files, backend="accelerator",
@@ -1199,6 +1226,8 @@ def setup_hccl(no_mpi=False):
     hccl_src_files = []
     for r, _, f in os.walk(hccl_src_dir):
         for fname in f:
+            if no_mpi and fname == "hccl_mpi_bootstrap.cc":
+                continue
             hccl_src_files.append(os.path.join(r, fname))
 
     ascend_home = os.environ.get("ASCEND_TOOLKIT_HOME")
@@ -1222,19 +1251,9 @@ def setup_hccl(no_mpi=False):
     from jittor import compiler
     extra = f" -I\"{hccl_include_path}\" "
     if no_mpi:
-        # MPI-free build: env/file rendezvous, no libmpi linked. BUT jittor's
-        # include scanner does not honor #ifdef, so it still needs to *locate*
-        # mpi_wrapper.h (referenced in the guarded-out #else branch) and the
-        # <mpi.h> it pulls in. Add the include dirs only -- NOT the link flags --
-        # so nothing from libmpi is actually compiled in or linked.
+        # MPI-free build: env/file rendezvous, hccl_mpi_bootstrap.cc omitted,
+        # no MPI headers or libmpi needed at all.
         extra += " -DJT_HCCL_NO_MPI "
-        mpi_inc = os.path.join(backend_root(jittor_path, "comm"), "mpi", "inc")
-        extra += f" -I\"{mpi_inc}\" "
-        if 'mpi_compile_flags' in globals() and mpi_compile_flags:
-            # reuse just the -I parts of the mpi compile flags (for <mpi.h>)
-            for tok in mpi_compile_flags.split():
-                if tok.startswith("-I"):
-                    extra += f" {tok} "
         gen_name = "jittor_hccl_core_nompi"
         LOG.i("setup_hccl: compiling hccl ops (MPI-free)...")
     else:

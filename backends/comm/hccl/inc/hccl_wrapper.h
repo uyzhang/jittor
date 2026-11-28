@@ -12,23 +12,21 @@
 // HCCL ops need the ACL runtime stream (aclstream) and ACL types; pull these in
 // for both build modes (the JIT-compiled op .cc only includes this header).
 #include "acl_jittor.h"
-// JT_HCCL_NO_MPI: build the HCCL ops WITHOUT any MPI dependency (env/file-based
-// rendezvous only). On Ascend the conda-OpenMPI + CANN combo crashes, so the
-// default multi-card path avoids libmpi entirely.
-#ifdef JT_HCCL_NO_MPI
+// Collective rank/world globals are declared directly here without pulling in
+// mpi_wrapper.h or <mpi.h>, so MPI-free builds (JT_HCCL_NO_MPI) need no MPI
+// headers at all. In MPI builds, hccl_mpi_bcast() is supplied by
+// hccl_mpi_bootstrap.cc.
 #include "core/common.h"
 namespace jittor {
-    // Minimal stand-ins for the few MPI globals the ops reference, so we don't
-    // pull in mpi_wrapper.h / libmpi. These are unused in env/file mode.
     EXTERN_LIB int mpi_world_size;
     EXTERN_LIB int mpi_world_rank;
     EXTERN_LIB int mpi_local_rank;
     EXTERN_LIB bool inside_mpi;
     EXTERN_LIB bool use_device_mpi;
-}
-#else
-#include "mpi_wrapper.h"
+#ifndef JT_HCCL_NO_MPI
+    void hccl_mpi_bcast(void* buf, int count, int root);
 #endif
+}
 
 // These used to log at LOGe and `return`. Inside an operator's jit_run() that
 // meant the collective silently did not run: the output var kept whatever

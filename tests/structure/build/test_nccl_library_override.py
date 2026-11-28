@@ -65,6 +65,7 @@ class TestNcclLibraryOverride(unittest.TestCase):
             return object()
         def compile_ops(sources, **kwargs):
             self.calls.append(("compile", kwargs["extra_flags"]))
+            self.last_sources = list(sources)
             return types.SimpleNamespace(ops=object())
         def reject_fallback(*args, **kwargs):
             raise AssertionError("Explicit NCCL selection unexpectedly fell back")
@@ -155,7 +156,9 @@ class TestNcclLibraryOverride(unittest.TestCase):
                   extra_environment={"SLURM_NTASKS": "2", "JT_BUILD_USE_MPI": "0"})
         flags = next(value for kind, value in self.calls if kind == "compile")
         self.assertIn("-DJT_NCCL_NO_MPI", flags)
-        self.assertIn("nompi_inc", flags)
+        self.assertNotIn("nompi_inc", flags)
+        self.assertNotIn("mpi/inc", flags)
+        self.assertFalse(any(src.endswith("nccl_mpi_bootstrap.cc") for src in self.last_sources))
         self._assert_linked(self.wheel_root)
 
     def test_slurm_with_mpi_preserves_mpi_compile_flags(self):
@@ -164,4 +167,5 @@ class TestNcclLibraryOverride(unittest.TestCase):
         flags = next(value for kind, value in self.calls if kind == "compile")
         self.assertIn("-DMPI_ENABLED", flags)
         self.assertNotIn("-DJT_NCCL_NO_MPI", flags)
+        self.assertTrue(any(src.endswith("nccl_mpi_bootstrap.cc") for src in self.last_sources))
         self._assert_linked(self.wheel_root)
