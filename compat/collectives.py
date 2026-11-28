@@ -102,7 +102,7 @@ def _all_gather_shards(local_shard):
         return local_shard
     if not jt.flags.use_cuda:
         from jittor import distributed
-        if distributed.get_backend() == "mpi":
+        if distributed.get_backend() in ("mpi", "gloo"):
             return distributed.all_gather(local_shard)
     ops = _nccl_ops()
     if ops is not None and callable(getattr(ops, "nccl_all_gather", None)):

@@ -8,11 +8,10 @@
 // file 'LICENSE.txt', which is part of this source code package.
 // ***************************************************************
 #pragma once
-// JT_NCCL_NO_MPI: build NCCL ops WITHOUT MPI (env/file rendezvous only), for the
-// no-mpirun DDP path. mpi_wrapper.h hard-includes <mpi.h>, so in this mode we
-// declare the few MPI globals the wrapper references directly (mirrors the HCCL
-// no-mpi build) and never pull in libmpi.
-#ifdef JT_NCCL_NO_MPI
+// Collective rank/world globals are declared directly here without pulling in
+// mpi_wrapper.h or <mpi.h>, so MPI-free builds (JT_NCCL_NO_MPI) need no MPI
+// headers or stub mpi.h at all. In MPI builds, nccl_mpi_bcast() is supplied by
+// nccl_mpi_bootstrap.cc.
 #include "core/common.h"
 namespace jittor {
     EXTERN_LIB int mpi_world_size;
@@ -21,10 +20,10 @@ namespace jittor {
     EXTERN_LIB int mpi_local_rank;
     EXTERN_LIB bool inside_mpi;
     EXTERN_LIB bool use_device_mpi;
-}
-#else
-#include "mpi_wrapper.h"
+#ifndef JT_NCCL_NO_MPI
+    void nccl_mpi_bcast(void* buf, int count, int root);
 #endif
+}
 
 #include <cuda_runtime.h>
 #include <nccl.h>

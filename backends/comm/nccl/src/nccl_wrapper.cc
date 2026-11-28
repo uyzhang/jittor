@@ -606,8 +606,7 @@ static int create_nccl_process_group(vector<int> ranks, const vector<int>* suppl
     rendezvous_require_unlocked(mpi_world_size, "NCCL ProcessGroup(MPI)");
     if (mpi_world_rank == root)
         checkCudaErrors(ncclGetUniqueId(&group_unique_id));
-    MPI_CHECK(MPI_Bcast((void*)&group_unique_id, sizeof(group_unique_id),
-                        MPI_BYTE, root, MPI_COMM_WORLD));
+    nccl_mpi_bcast((void*)&group_unique_id, sizeof(group_unique_id), root);
 #endif
     }
 
@@ -737,7 +736,7 @@ void nccl_init() {
     rendezvous_require_unlocked(mpi_world_size, "NCCL(MPI)");
     if (mpi_world_rank == 0)
         checkCudaErrors(ncclGetUniqueId(&id));
-    MPI_CHECK(MPI_Bcast((void *)&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    nccl_mpi_bcast((void *)&id, sizeof(id), 0);
     register_nccl_world_group(
         init_nccl_comm(mpi_world_size, mpi_world_rank, id),
         mpi_world_size, mpi_world_rank);

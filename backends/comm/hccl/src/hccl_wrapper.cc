@@ -219,7 +219,7 @@ void hccl_init() {
     rendezvous_require_unlocked(mpi_world_size, "HCCL(MPI)");
     if (mpi_world_rank == 0)
         HCCLCHECK(HcclGetRootInfo(&root_info));
-    MPI_CHECK(MPI_Bcast(&root_info, HCCL_ROOT_INFO_BYTES, MPI_CHAR, 0, MPI_COMM_WORLD));
+    hccl_mpi_bcast(&root_info, HCCL_ROOT_INFO_BYTES, 0);
     // Rank count / rank id for the collective communicator must come from
     // the MPI world, NOT the local device_count (which broke multi-node and
     // any run where ranks != visible devices).
@@ -276,8 +276,7 @@ int hccl_create_process_group(vector<int> ranks) {
     rendezvous_require_unlocked(mpi_world_size, "HCCL ProcessGroup(MPI)");
     if (mpi_world_rank == root)
         HCCLCHECK(HcclGetRootInfo(&group_root_info));
-    MPI_CHECK(MPI_Bcast(&group_root_info, HCCL_ROOT_INFO_BYTES, MPI_CHAR,
-                        root, MPI_COMM_WORLD));
+    hccl_mpi_bcast(&group_root_info, HCCL_ROOT_INFO_BYTES, root);
 #endif
 
     HcclProcessGroupState group;

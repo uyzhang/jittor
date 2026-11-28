@@ -472,6 +472,22 @@ def _init_process_group(*args, **kwargs):
         )
     backend = kwargs.get("backend", args[0] if args else None)
     backend_name = str(backend).lower() if backend is not None else None
+    gloo_requested = (
+        backend_name is not None
+        and any(tok.strip() in ("gloo", "cpu:gloo") for tok in backend_name.split(","))
+    )
+    if gloo_requested and not _native_distributed_active():
+        _process_group.init_process_group(
+            backend="gloo",
+            store=store,
+            init_method=None,
+            rank=requested_rank,
+            world_size=requested_world_size,
+            timeout=kwargs.get("timeout"),
+        )
+        state["initialized"] = True
+        state["store"] = _process_group.get_default_store()
+        return None
     if requested_world_size > 1 and not _native_distributed_active():
         _bootstrap_native_distributed(
             requested_rank, requested_world_size, backend=backend,
@@ -503,6 +519,11 @@ def _init_process_group(*args, **kwargs):
 def _destroy_process_group(*args, **kwargs):
     _context = get_install_context(jt).state["distributed_api"]
     state = _context['state']
+    if _process_group.is_initialized() and _process_group.get_backend() == "gloo":
+        _process_group.destroy_process_group()
+        state["store"] = None
+        state["initialized"] = False
+        return None
     store = state.get("store")
     close = getattr(store, "close", None)
     if callable(close):
@@ -565,6 +586,10 @@ def _all_reduce(tensor, op=None, group=None, async_op=False):
     reduce_name = _reduce_name(op, _ReduceOp)
     if group is not None and hasattr(group, "_all_reduce"):
         result = group._all_reduce(tensor, reduce_name)
+        _copy_tensor(tensor, result)
+        return _collective_result(tensor, async_op, issued=True)
+    if size > 1 and _process_group.is_initialized() and _process_group.get_backend() == "gloo":
+        result = _process_group.all_reduce(tensor, op=reduce_name)
         _copy_tensor(tensor, result)
         return _collective_result(tensor, async_op, issued=True)
     if size > 1:
@@ -647,14 +672,21 @@ def _broadcast(tensor, src=0, group=None, async_op=False, group_src=None):
     root = int(src if group_src is None else
                _api_dist_get_global_rank(group, group_src))
     if size > 1:
+        use_pg = (
+            group is not None
+            or (_process_group.is_initialized() and _process_group.get_backend() == "gloo")
+        )
         result = (_process_group.broadcast(tensor, src=root, group=group)
-                  if group is not None else tensor.mpi_broadcast(root))
+                  if use_pg else tensor.mpi_broadcast(root))
         _copy_tensor(tensor, result)
     return _collective_result(tensor, async_op, issued=size > 1)
 
 
 def _barrier(group=None, async_op=False, device_ids=None):
-    size = _require_supported_group(group)
+    size = _require_supported_group(group, allow_subgroup=True)
+    if size > 1 and _process_group.is_initialized() and _process_group.get_backend(group) == "gloo":
+        _process_group.barrier(group=group)
+        return _collective_result(None, async_op, issued=False)
     marker = None
     if size > 1:
         marker = jt.array(np.asarray([_distributed_rank()], dtype=np.int32))
@@ -1115,7 +1147,14 @@ def _api_dist_is_available(*a, **k):
 
 
 def _api_dist_is_backend_available(backend):
-    return bool(getattr(jt, 'has_cuda', False)) if str(backend).lower() == 'nccl' else bool(getattr(jt.compile_extern, 'has_mpi', False)) if str(backend).lower() == 'mpi' else False
+    name = str(backend).lower()
+    if name == 'gloo':
+        return True
+    if name == 'nccl':
+        return bool(getattr(jt, 'has_cuda', False))
+    if name == 'mpi':
+        return bool(getattr(jt.compile_extern, 'has_mpi', False))
+    return False
 
 
 def _api_dist_is_nccl_available():

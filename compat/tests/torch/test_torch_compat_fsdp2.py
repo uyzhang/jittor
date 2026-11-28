@@ -1080,8 +1080,8 @@ class TestFSDP2Compat(unittest.TestCase):
         # unconditionally only says which machine the suite last ran on.
         self.assertEqual(
             is_backend_available("nccl"), _test_capability.check_accelerator("cuda", backend=jt).enabled)
-        self.assertFalse(is_backend_available("gloo"))
-        self.assertFalse(is_gloo_available())
+        self.assertTrue(is_backend_available("gloo"))
+        self.assertTrue(is_gloo_available())
         self.assertEqual(is_nccl_available(), is_backend_available("nccl"))
         self.assertEqual(is_mpi_available(), is_backend_available("mpi"))
         self.assertEqual(
