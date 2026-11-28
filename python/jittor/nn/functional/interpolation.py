@@ -8,6 +8,7 @@ from jittor._core.dtypes import dtype_name
 from jittor._core.var import device_scope_like
 from jittor._runtime.dispatch import dispatch_context, try_dispatch
 from ._layout import channels_last_source, channels_last_view, records_no_grad
+from jittor.backends.cuda.kernels.nn import resize_cuda as _cuda_resize_kernels  # noqa: F401
 
 
 def _bicubic(x, a, func):
@@ -314,10 +315,10 @@ def resize(img, size, mode="nearest", align_corners=False, tf_mode=False):
         x, y = jt.meshgrid(jt.arange(0, H, 1), jt.arange(0, W, 1))
         startH = jt.floor(x * h / H).int32()
         endH = jt.ceil((x + 1) * h / H).int32()
-        maxH = int(jt.max(endH - startH).data)
+        maxH = max(((i + 1) * h + H - 1) // H - (i * h) // H for i in range(H))
         startW = jt.floor(y * w / W).int32()
         endW = jt.ceil((y + 1) * w / W).int32()
-        maxW = int(jt.max(endW - startW).data)
+        maxW = max(((i + 1) * w + W - 1) // W - (i * w) // W for i in range(W))
         pixel_count = (endH - startH) * (endW - startW)
         adaptive_output = img.reindex(
             [img.shape[0], img.shape[1], H, W, maxH, maxW],

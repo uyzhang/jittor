@@ -8,6 +8,7 @@ import numpy as np
 
 from .interpolation import _interpolate
 from ..._runtime.dispatch import register_kernel, select_kernel
+from jittor.backends.cuda.kernels.nn import grid_sample_cuda as _cuda_grid_sample_kernels  # noqa: F401
 
 
 def grid_sample_v0(input, grid, mode="bilinear", padding_mode="zeros"):
@@ -58,11 +59,14 @@ def grid_sample_v0(input, grid, mode="bilinear", padding_mode="zeros"):
 def linspace_from_neg_one(grid, num_steps, align_corners):
     if num_steps <= 1:
         return jt.array([], dtype=grid.dtype)
-    # TODO: use jt.index
-    ra = np.linspace(-1, 1, num_steps)
+    # Build coordinates directly on the target device with jt.index instead of
+    # np.linspace (which forces a host-to-device copy on every affine_grid call).
+    idx = jt.index((num_steps,), dim=0).cast(grid.dtype)
+    step = 2.0 / (num_steps - 1)
+    ra = idx * step - 1.0
     if not align_corners:
-        ra = ra * (num_steps - 1) / num_steps
-    return jt.array(ra, dtype=grid.dtype)
+        ra = ra * ((num_steps - 1) / num_steps)
+    return ra
 
 
 def _make_base_grid_4d_acl(theta, N, C, H, W, align_corners):
@@ -76,8 +80,10 @@ def _make_base_grid_4d_acl(theta, N, C, H, W, align_corners):
 
 def _make_base_grid_4d(theta, N, C, H, W, align_corners):
     base_grid = jt.zeros((N, H, W, 3), dtype=theta.dtype)
-    base_grid[..., 0] = jt.nn.linspace_from_neg_one(theta, W, align_corners)
-    base_grid[..., 1] = jt.unsqueeze(jt.nn.linspace_from_neg_one(theta, H, align_corners), -1)
+    if W > 1:
+        base_grid[..., 0] = jt.nn.linspace_from_neg_one(theta, W, align_corners)
+    if H > 1:
+        base_grid[..., 1] = jt.unsqueeze(jt.nn.linspace_from_neg_one(theta, H, align_corners), -1)
     base_grid[..., -1] = 1
     return base_grid
 
@@ -95,11 +101,14 @@ def _make_base_grid_5d_acl(theta, N, C, D, H, W, align_corners):
 
 def _make_base_grid_5d(theta, N, C, D, H, W, align_corners):
     base_grid = jt.zeros((N, D, H, W, 4), dtype=theta.dtype)
-    base_grid[..., 0] = jt.nn.linspace_from_neg_one(theta, W, align_corners)
-    base_grid[..., 1] = jt.unsqueeze(jt.nn.linspace_from_neg_one(theta, H, align_corners), -1)
-    base_grid[..., 2] = jt.unsqueeze(
-        jt.unsqueeze(jt.nn.linspace_from_neg_one(theta, D, align_corners), -1), -1
-    )
+    if W > 1:
+        base_grid[..., 0] = jt.nn.linspace_from_neg_one(theta, W, align_corners)
+    if H > 1:
+        base_grid[..., 1] = jt.unsqueeze(jt.nn.linspace_from_neg_one(theta, H, align_corners), -1)
+    if D > 1:
+        base_grid[..., 2] = jt.unsqueeze(
+            jt.unsqueeze(jt.nn.linspace_from_neg_one(theta, D, align_corners), -1), -1
+        )
     base_grid[..., -1] = 1
     return base_grid
 
@@ -123,6 +132,10 @@ def make_base_grid_5D(theta, N, C, D, H, W, align_corners):
 
 
 def affine_grid_generator_4D(theta, N, C, H, W, align_corners):
+    from ..._runtime.dispatch import try_dispatch
+    fast = try_dispatch("nn.affine_grid_4d", theta, N, C, H, W, align_corners)
+    if fast is not None:
+        return fast
     base_grid = jt.nn.make_base_grid_4D(theta, N, C, H, W, align_corners)
     grid = jt.nn.bmm(base_grid.reshape(N, H * W, 3), theta.transpose(0, 2, 1))
     return grid.reshape(N, H, W, 2)
