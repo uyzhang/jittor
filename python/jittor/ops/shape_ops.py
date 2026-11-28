@@ -540,6 +540,15 @@ def triu(input: Var, diagonal:int=0) -> Var:
     result = try_dispatch("tensor.triu", input, diagonal)
     if result is not None:
         return result
+    nd = input.ndim
+    if nd >= 2:
+        d = int(diagonal)
+        return input.reindex(
+            input.shape,
+            [f"i{k}" for k in range(nd)],
+            overflow_conditions=[f"i{nd - 2} > i{nd - 1} - ({d})"],
+            overflow_value=0,
+        )
     index = input.index()
     mask = index[-2] <= index[-1] - diagonal
     return jt.ternary(mask, input, jt.zeros_like(input))
@@ -565,6 +574,15 @@ def tril(input: Var, diagonal:int=0) -> Var:
 
     '''
     import jittor as jt
+    nd = input.ndim
+    if nd >= 2:
+        d = int(diagonal)
+        return input.reindex(
+            input.shape,
+            [f"i{k}" for k in range(nd)],
+            overflow_conditions=[f"i{nd - 2} < i{nd - 1} - ({d})"],
+            overflow_value=0,
+        )
     index = input.index()
     mask = index[-2] >= index[-1] - diagonal
     return jt.ternary(mask, input, jt.zeros_like(input))

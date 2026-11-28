@@ -40,13 +40,19 @@ ArgReduceOp::ArgReduceOp(Var* x, NanoString op, int dim, bool keepdims)
     if (backend != BackendId::Cpu) {
         if (has_op_capability(backend, OpCapability::SegmentedArgReduce)) {
             int dims = x->shape.size();
-            vector<int64> axes;
-            axes.reserve(dims);
-            for (int i = 0; i < dims; ++i)
-                if (i != dim)
-                    axes.push_back(i);
-            axes.push_back(dim);
-            auto tranpose1 = make_transpose(x, axes);
+            bool need_transpose = (dim != dims - 1);
+            VarPtr tranpose1;
+            if (need_transpose) {
+                vector<int64> axes;
+                axes.reserve(dims);
+                for (int i = 0; i < dims; ++i)
+                    if (i != dim)
+                        axes.push_back(i);
+                axes.push_back(dim);
+                tranpose1 = make_transpose(x, axes);
+            } else {
+                tranpose1 = x;
+            }
 
             int m = 1;
             for (int i = 0; i < dims - 1; ++i) {
@@ -60,7 +66,7 @@ ArgReduceOp::ArgReduceOp(Var* x, NanoString op, int dim, bool keepdims)
                 backend, OpCapability::SegmentedArgReduce, tranpose1, offsets, op, keepdims);
             if (segmented_reduce) {
                 auto var = segmented_reduce(tranpose1, offsets, op, keepdims);
-                if (keepdims) {
+                if (keepdims && need_transpose) {
                     vector<int64> axes2;
                     axes2.reserve(dims);
                     for (int i = 0; i < dims; ++i) {

@@ -686,6 +686,88 @@ __device__ __forceinline__ int64_t t0_reduce_combine_i64(T0ReduceOp op, int64_t 
     }
 }
 
+__device__ __forceinline__ float t0_reduce_init_f32(T0ReduceOp op) {
+    switch (op) {
+        case T0ReduceOp::Add:
+        case T0ReduceOp::Mean:     return 0.0f;
+        case T0ReduceOp::Multiply: return 1.0f;
+        case T0ReduceOp::Maximum:  return -CUDART_INF_F;
+        case T0ReduceOp::Minimum:  return CUDART_INF_F;
+        default:                   return 0.0f;
+    }
+}
+
+__device__ __forceinline__ float t0_reduce_combine_f32(T0ReduceOp op, float a, float b) {
+    switch (op) {
+        case T0ReduceOp::Add:
+        case T0ReduceOp::Mean:     return a + b;
+        case T0ReduceOp::Multiply: return a * b;
+        case T0ReduceOp::Maximum:  return t0_max_f32(a, b);
+        case T0ReduceOp::Minimum:  return t0_min_f32(a, b);
+        default:                   return a;
+    }
+}
+
+// Native FP32 block-parallel reduction using warp shuffles (1 __syncthreads
+// instead of 8 and FP32 throughput instead of 1/64-rate FP64 on consumer GPUs).
+__global__ void k_reduce_block_f32(T0ReduceOp op, const float* __restrict__ x,
+                                   float* __restrict__ y, T0ReduceMeta m) {
+    __shared__ float s_warp[8];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    for (int32_t out_idx = blockIdx.x; out_idx < m.out_num; out_idx += gridDim.x) {
+        if (m.red_num == 0) {
+            if (tid == 0) {
+                y[out_idx] = (op == T0ReduceOp::Mean) ? ::nanf("") : t0_reduce_init_f32(op);
+            }
+            continue;
+        }
+        const int32_t base = t0_red_base_offset(out_idx, m);
+        float acc = t0_reduce_init_f32(op);
+        for (int32_t r = tid; r < m.red_num; r += blockDim.x) {
+            acc = t0_reduce_combine_f32(op, acc, x[base + t0_red_step_offset(r, m)]);
+        }
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            acc = t0_reduce_combine_f32(op, acc, __shfl_down_sync(0xffffffffu, acc, d));
+        }
+        if (lane == 0) s_warp[wid] = acc;
+        __syncthreads();
+        if (wid == 0) {
+            float v = (lane < 8) ? s_warp[lane] : t0_reduce_init_f32(op);
+            #pragma unroll
+            for (int d = 4; d > 0; d >>= 1) {
+                v = t0_reduce_combine_f32(op, v, __shfl_down_sync(0xffffffffu, v, d));
+            }
+            if (lane == 0) {
+                if (op == T0ReduceOp::Mean) v /= (float)m.red_num;
+                y[out_idx] = v;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_reduce_thread_f32(T0ReduceOp op, const float* __restrict__ x,
+                                    float* __restrict__ y, T0ReduceMeta m) {
+    int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t stride = gridDim.x * blockDim.x;
+    for (int32_t out_idx = tid; out_idx < m.out_num; out_idx += stride) {
+        if (m.red_num == 0) {
+            y[out_idx] = (op == T0ReduceOp::Mean) ? ::nanf("") : t0_reduce_init_f32(op);
+            continue;
+        }
+        int32_t base = t0_red_base_offset(out_idx, m);
+        float acc = t0_reduce_init_f32(op);
+        for (int32_t r = 0; r < m.red_num; ++r) {
+            acc = t0_reduce_combine_f32(op, acc, x[base + t0_red_step_offset(r, m)]);
+        }
+        if (op == T0ReduceOp::Mean) acc /= (float)m.red_num;
+        y[out_idx] = acc;
+    }
+}
+
 // Block-parallel reduction: 1 block of 256 threads per output slot (loops over out_idx if > gridDim.x).
 __global__ void k_reduce_block(T0ReduceOp op, T0DType tx, T0DType ty,
                                const void* x, void* y, T0ReduceMeta m) {
@@ -863,11 +945,25 @@ void cuda_tier0_broadcast(T0DType tx, const void* x, void* z, const T0ShapeMeta&
 void cuda_tier0_reduce(T0ReduceOp op, T0DType tx, T0DType ty,
                        const void* x, void* y, const T0ReduceMeta& meta) {
     if (meta.out_num <= 0) return;
+    const bool is_f32_arith = (tx == T0DType::F32 && ty == T0DType::F32 &&
+        (op == T0ReduceOp::Add || op == T0ReduceOp::Mean ||
+         op == T0ReduceOp::Multiply || op == T0ReduceOp::Maximum ||
+         op == T0ReduceOp::Minimum));
     if (meta.red_num >= 16 || meta.out_num < 1024) {
         int blocks = std::min<int>(meta.out_num, 65535);
-        k_reduce_block<<<blocks, 256, 0, cudaStreamPerThread>>>(op, tx, ty, x, y, meta);
+        if (is_f32_arith) {
+            k_reduce_block_f32<<<blocks, 256, 0, cudaStreamPerThread>>>(
+                op, static_cast<const float*>(x), static_cast<float*>(y), meta);
+        } else {
+            k_reduce_block<<<blocks, 256, 0, cudaStreamPerThread>>>(op, tx, ty, x, y, meta);
+        }
     } else {
-        k_reduce_thread<<<choose_blocks(meta.out_num), 256, 0, cudaStreamPerThread>>>(op, tx, ty, x, y, meta);
+        if (is_f32_arith) {
+            k_reduce_thread_f32<<<choose_blocks(meta.out_num), 256, 0, cudaStreamPerThread>>>(
+                op, static_cast<const float*>(x), static_cast<float*>(y), meta);
+        } else {
+            k_reduce_thread<<<choose_blocks(meta.out_num), 256, 0, cudaStreamPerThread>>>(op, tx, ty, x, y, meta);
+        }
     }
     checkCudaErrors(cudaGetLastError());
 }

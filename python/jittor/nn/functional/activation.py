@@ -215,8 +215,12 @@ def elu(x: jt.Var, alpha: float = 1.0) -> jt.Var:
         >>> nn.elu(a)
         jt.Var([-0.31873488 -0.6782155   2.128115  ], dtype=float32)
     '''
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("nn.elu", x, alpha=alpha)
+    if fast is not None:
+        return fast
     negative_x = jt.ternary(x > 0, 0.0, x)
-    return jt.ternary(x > 0, x, alpha*_stable_expm1(negative_x))
+    return jt.ternary(x > 0, x, alpha * jt.expm1(negative_x))
 
 
 def _stable_expm1(x):
@@ -453,6 +457,7 @@ def softplus(x, beta=1.0, threshold=20.0):
     dtype = _jittor_dtype_name(x.dtype)
     if dtype not in ("float16", "bfloat16", "float32", "float64"):
         raise TypeError("softplus requires a real floating input")
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
     fast = try_dispatch("nn.softplus", x, beta=beta, threshold=threshold)
     if fast is not None:
         return fast
@@ -477,4 +482,8 @@ def mish(x, inplace=False):
     if inplace:
         _arg_policy.ignored("jittor.nn.mish", "inplace", inplace,
                             _INPLACE_CONSEQUENCE)
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("nn.mish", x)
+    if fast is not None:
+        return fast
     return x * jt.tanh(jt.nn.softplus(x))

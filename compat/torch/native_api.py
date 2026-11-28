@@ -47,7 +47,7 @@ class NativeOperation:
     """An installation-independent identity for one native mathematical API."""
 
     _SPECIAL_OPS = frozenset((
-        "pow", "rsqrt", "sqrt", "mul", "multiply", "sub", "subtract",
+        "pow", "prod", "rsqrt", "sqrt", "mul", "multiply", "sub", "subtract",
         "linalg.svd", "fft.fftfreq", "fft.rfftfreq", "unique", "unique_consecutive",
     ))
 
@@ -112,6 +112,10 @@ class NativeOperation:
             # functions name it differently, so pass it positionally.
             kwargs = dict(kwargs)
             args = (kwargs.pop("input"),)
+        if self._operation_key == "prod" and args and isinstance(args[0], context.state["Var"]):
+            from .installers.tensor.shape_api import _method_prod
+            with tensor_frontend(context.state["Var"]):
+                return _method_prod(args[0], *args[1:], **kwargs)
         defaults = self._TORCH_DEFAULTS.get(self._operation_key)
         if defaults:
             kwargs = dict(kwargs)

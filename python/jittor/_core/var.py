@@ -697,14 +697,13 @@ def var(x, dim=None, dims=None, unbiased=False, keepdims=False, keepdim=None):
         dims = [dim]
 
     mean = jt.mean(x, dims, keepdims=True)
-    mean = jt.broadcast(mean, shape)
 
     n = 1
     for d in dims:
         n *= shape[d]
         new_shape[d] = 1
 
-    sqr = (x - mean) ** 2
+    sqr = (x - mean).sqr()
     sqr = jt.sum(sqr, dims=dims, keepdims=False)
     if unbiased:
         n -= 1

@@ -350,6 +350,11 @@ def _ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0,
 def _api_F_logsigmoid(input):
     # The piecewise min/abs form has a zero subgradient at x=0. Preference
     # losses start at exactly zero log-ratio and require d/dx logsigmoid(0)=1/2.
+    from jittor._runtime.dispatch import try_dispatch
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("nn.logsigmoid", input)
+    if fast is not None:
+        return fast
     return -jt.nn.softplus(-input)
 
 
@@ -366,8 +371,13 @@ def _api_F_celu(input, alpha=1.0, inplace=False):
     _check_activation_input(input, "celu")
     if alpha == 0:
         raise RuntimeError("ZeroDivisionError: alpha cannot be 0 for CELU")
+    from jittor._runtime.dispatch import try_dispatch
+    from jittor.backends.cuda.kernels.math import pointwise_cuda as _pw_cuda  # noqa: F401
+    fast = try_dispatch("nn.celu", input, alpha=alpha)
+    if fast is not None:
+        return _activation_result(input, fast, inplace)
     negative_input = jt.ternary(input > 0, 0.0, input)
-    negative = alpha * _stable_expm1(negative_input / alpha)
+    negative = alpha * jt.expm1(negative_input / alpha)
     output = jt.ternary(input > 0, input, negative)
     return _activation_result(input, output, inplace)
 
