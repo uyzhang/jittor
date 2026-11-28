@@ -602,7 +602,10 @@ static std::string emit_binary_expr(
             return emit_from_float(
                 "_jt_signed_pow_f32(" + emit_as_float(x, tx) + ", " + emit_as_float(y, ty) + ")", tz);
         }
-        // Match common_op_type_cuda_map: jittor::_signed_pow(double, double) cast to tz
+        if (tz == NvrtcDType::F32) {
+            return "_jt_signed_pow_f32(" + emit_as_float(x, tx) + ", " + emit_as_float(y, ty) + ")";
+        }
+        // Match common_op_type_cuda_map: float64 and integer pow compute in double then cast to tz
         std::string d = "_jt_signed_pow_f64(" + emit_as_double(x, tx) + ", " + emit_as_double(y, ty) + ")";
         if (tz == NvrtcDType::F64) return d;
         return "((" + std::string(storage_ctype(tz)) + ")(" + d + "))";

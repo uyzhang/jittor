@@ -1321,7 +1321,12 @@ PyObject* jt_concat(PyObject* tensors, int64 dim) {
 }
 
 PyObject* fast_clamp(PyObject* self, PyObject* min_v, PyObject* max_v) {
-    if (Py_TYPE(self) != &PyjtVarHolder.ht_type) return not_implemented();
+    if (!PyObject_TypeCheck(self, &PyjtVarHolder.ht_type)) return not_implemented();
+    PyTypeObject* self_type = Py_TYPE(self);
+    if (self_type != &PyjtVarHolder.ht_type
+            && (!self_type->tp_dict
+                || PyDict_GetItemString(self_type->tp_dict, "_frontend_backend") == nullptr))
+        return not_implemented();
     if (!clamp_scalar(min_v) || !clamp_scalar(max_v)) return not_implemented();
     if (min_v == Py_None && max_v == Py_None) return not_implemented();
     // Read as the bindings `_clamp_cpu` calls would read it.

@@ -63,7 +63,7 @@ def _selu(input, inplace=False):
     a = 1.6732632423543772848170429916717
     s = 1.0507009873554804934193349852946
     negative_input = jt.ternary(input > 0, 0.0, input)
-    negative = a * _stable_expm1(negative_input)
+    negative = a * jt.expm1(negative_input)
     output = jt.ternary(input > 0, s * input, s * negative)
     return _activation_result(input, output, inplace)
 

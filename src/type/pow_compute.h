@@ -26,8 +26,17 @@ namespace jittor {
 
 #ifdef JIT_cuda
 
-inline __device__ double _signed_pow(double x, double y) {
-    if (x < 0 && ::floor(y) == y)
+inline __device__ float _signed_pow(float x, float y) {
+    if (x < 0.0f && ::floorf(y) == y)
+        return ::powf(-x, y) * (::fmodf(y, 2.0f) != 0.0f ? -1.0f : 1.0f);
+    return ::powf(x, y);
+}
+
+template <typename Tx, typename Ty>
+inline __device__ double _signed_pow(Tx x_in, Ty y_in) {
+    double x = static_cast<double>(x_in);
+    double y = static_cast<double>(y_in);
+    if (x < 0.0 && ::floor(y) == y)
         return ::pow(-x, y) * (::fmod(y, 2.0) != 0.0 ? -1.0 : 1.0);
     return ::pow(x, y);
 }

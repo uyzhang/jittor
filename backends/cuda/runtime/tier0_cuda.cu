@@ -354,7 +354,7 @@ __global__ void k_binary_f32_contig(T0BinaryOp op, const float* x, const float* 
             case T0BinaryOp::FloorDivide: r = t0_floor_div_f32(a, b); break;
             case T0BinaryOp::Mod:         r = t0_floor_mod_f32(a, b); break;
             case T0BinaryOp::Fmod:        r = ::fmodf(a, b); break;
-            case T0BinaryOp::Pow:         r = static_cast<float>(t0_signed_pow_f64((double)a, (double)b)); break;
+            case T0BinaryOp::Pow:         r = t0_signed_pow_f32(a, b); break;
             case T0BinaryOp::Maximum:     r = t0_max_f32(a, b); break;
             case T0BinaryOp::Minimum:     r = t0_min_f32(a, b); break;
             default: break;
@@ -447,11 +447,7 @@ __global__ void k_binary_generic(T0BinaryOp op, T0DType tx, T0DType ty, T0DType 
                 case T0BinaryOp::FloorDivide: r = t0_floor_div_f32(a, b); break;
                 case T0BinaryOp::Mod:         r = t0_floor_mod_f32(a, b); break;
                 case T0BinaryOp::Fmod:        r = ::fmodf(a, b); break;
-                case T0BinaryOp::Pow:
-                    r = (tz == T0DType::F32)
-                        ? static_cast<float>(t0_signed_pow_f64((double)a, (double)b))
-                        : t0_signed_pow_f32(a, b);
-                    break;
+                case T0BinaryOp::Pow:         r = t0_signed_pow_f32(a, b); break;
                 case T0BinaryOp::Maximum:     r = t0_max_f32(a, b); break;
                 case T0BinaryOp::Minimum:     r = t0_min_f32(a, b); break;
                 default: break;
