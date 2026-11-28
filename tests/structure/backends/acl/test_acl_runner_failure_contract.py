@@ -130,9 +130,9 @@ def test_ascend_guide_states_the_launcher_migration_is_closed():
         "KVCacheMemcpy never had a tail",
         "npu-smi info",
         "Fallback attempts are NOT NPU validation",
-        "must not report hardware validation",
-        "acl-host-syntax-check",
-        "It is not hardware validation.",
+            "must not report hardware validation",
+            "jittor-ascend-acl",
+            "It is not hardware validation.",
     ):
         assert required in guide
 

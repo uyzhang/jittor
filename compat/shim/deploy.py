@@ -98,10 +98,18 @@ def _destination(target, *parts):
     return destination
 
 
-def _stub_python_files(stubs):
+#: Stub packages that alter upstream framework auto-detection (for example,
+#: Transformers/Accelerate switch into XLA mode whenever ``torch_xla`` is
+#: importable unless ``USE_TORCH_XLA=0`` is set). Keep them opt-in via
+#: ``jittor-torch-shim --with-xla`` / ``deploy(..., include_xla=True)``.
+OPTIONAL_STUBS = frozenset(("torch_xla",))
+
+
+def _stub_python_files(stubs, include_optional=()):
     """Yield stub Python files and their paths relative to ``stubs``."""
     if os.path.islink(stubs) or not os.path.isdir(stubs):
         raise RuntimeError("missing or unsafe stubs directory: %s" % stubs)
+    enabled_optional = frozenset(include_optional)
     package_count = 0
     for package in sorted(os.listdir(stubs)):
         package_root = os.path.join(stubs, package)
@@ -110,6 +118,8 @@ def _stub_python_files(stubs):
         if not os.path.isdir(package_root):
             continue
         if package == "__pycache__":
+            continue
+        if package in OPTIONAL_STUBS and package not in enabled_optional:
             continue
         package_init = os.path.join(package_root, "__init__.py")
         if not os.path.isfile(package_init):
@@ -143,7 +153,7 @@ def _stub_python_files(stubs):
         raise RuntimeError("stubs directory contains no Python packages: %s" % stubs)
 
 
-def _plan(target, resource_root=None):
+def _plan(target, resource_root=None, include_xla=False):
     """Return list of (src, dst) copy operations."""
     target = _normalise_target(target)
     root = os.fspath(resource_root or resources_root())
@@ -155,7 +165,8 @@ def _plan(target, resource_root=None):
         _destination(target, "torch", "__init__.py"),
     )]
     stubs = os.path.join(root, "stubs")
-    for source, parts in _stub_python_files(stubs):
+    include_optional = ("torch_xla",) if include_xla else ()
+    for source, parts in _stub_python_files(stubs, include_optional=include_optional):
         ops.append((source, _destination(target, *parts)))
     meta = _required_source_file(
         os.path.join(root, "torch_dist_info", "METADATA"), "torch metadata"
@@ -259,10 +270,12 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def check_details(target=None, resource_root=None):
+def check_details(target=None, resource_root=None, include_xla=None):
     """Return ``(target, [(kind, path), ...])`` for deployment differences."""
     target = _normalise_target(target or _default_site_packages())
-    plan = _plan(target, resource_root=resource_root)
+    if include_xla is None:
+        include_xla = os.path.lexists(os.path.join(target, "torch_xla"))
+    plan = _plan(target, resource_root=resource_root, include_xla=bool(include_xla))
     expected = {destination: source for source, destination in plan}
     problems = []
 
@@ -283,11 +296,15 @@ def _reported_path(requested_target, normalised_target, path):
     return os.path.join(os.fspath(requested_target), relative)
 
 
-def deploy(target=None, resource_root=None):
+def deploy(target=None, resource_root=None, include_xla=False):
     requested_target = target or _default_site_packages()
     normalised_target = _normalise_target(requested_target)
     done = []
-    plan = _plan(normalised_target, resource_root=resource_root)
+    plan = _plan(
+        normalised_target,
+        resource_root=resource_root,
+        include_xla=bool(include_xla),
+    )
     for src, dst in plan:
         _ensure_safe_parent(normalised_target, dst)
         _ensure_distinct_files(src, dst)
@@ -299,11 +316,11 @@ def deploy(target=None, resource_root=None):
     return requested_target, done
 
 
-def check(target=None, resource_root=None):
+def check(target=None, resource_root=None, include_xla=None):
     """Return the historical ``(target, problem_paths)`` result shape."""
     requested_target = target or _default_site_packages()
     normalised_target, problems = check_details(
-        requested_target, resource_root=resource_root
+        requested_target, resource_root=resource_root, include_xla=include_xla
     )
     return requested_target, [
         _reported_path(requested_target, normalised_target, path)
@@ -314,14 +331,17 @@ def check(target=None, resource_root=None):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     target = None
+    include_xla = "--with-xla" in argv
     if "--target" in argv:
         i = argv.index("--target")
-        if i + 1 >= len(argv) or argv[i + 1] in ("--check", "--target"):
+        if i + 1 >= len(argv) or argv[i + 1] in ("--check", "--target", "--with-xla"):
             print("torch-shim deploy: --target requires a path")
             return 2
         target = argv[i + 1]
     if "--check" in argv:
-        t, problems = check_details(target)
+        t, problems = check_details(
+            target, include_xla=True if include_xla else None
+        )
         if problems:
             print(f"torch-shim NOT fully deployed in {t}; found {len(problems)} problem(s):")
             for kind, path in problems:
@@ -329,7 +349,7 @@ def main(argv=None):
             return 1
         print(f"torch-shim deployed in {t} (all files present and match source)")
         return 0
-    t, done = deploy(target)
+    t, done = deploy(target, include_xla=include_xla)
     print(f"torch-shim deployed into {t}:")
     for d in done:
         print("  +", os.path.relpath(d, t))
