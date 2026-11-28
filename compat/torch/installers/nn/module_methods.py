@@ -1088,6 +1088,8 @@ def _module_to_conversion(ds, dev, copy, v):
     # A moved view must be rebound instead of assigning through its old storage.
     if _device_is_cpu(dev):
         out = _make_cpu_resident(out, inplace=out is v and v._base is None)
+        if getattr(out, "_jittor_torch_meta", False):
+            out._jittor_torch_meta = False
     elif _device_is_cuda(dev):
         inplace = out is v and v._base is None
         out = _make_cuda_resident(out, force=True, inplace=inplace)
@@ -1112,6 +1114,8 @@ def _module_to_conversion(ds, dev, copy, v):
                     out = v
                 else:
                     out = moved
+        if getattr(out, "_jittor_torch_meta", False):
+            out._jittor_torch_meta = False
     return out
 
 

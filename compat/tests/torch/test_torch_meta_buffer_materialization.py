@@ -118,3 +118,58 @@ class TestMetaBufferPlacement(unittest.TestCase):
             "inv_freq", torch.arange(4, dtype=torch.float32), persistent=False)
         module.to("cuda")
         self.assertTrue(module.inv_freq.is_cuda)
+
+
+class TestMetaDeviceContextSemantics(unittest.TestCase):
+    """``with torch.device('meta')`` marks newly constructed tensors accurately."""
+
+    def test_tensor_and_factories_honor_meta_context_and_nesting(self):
+        with jt.flag_scope(use_cuda=0):
+            pre_existing = torch.zeros((2,))
+            with torch.device("meta"):
+                # Pre-existing tensors must keep their original device.
+                self.assertEqual(pre_existing.device.type, "cpu")
+                self.assertFalse(pre_existing.is_meta)
+
+                # Transformers probes ``torch.tensor([]).device`` to detect
+                # meta construction and skip eager weight init.
+                probe = torch.tensor([])
+                self.assertEqual(probe.device, torch.device("meta"))
+                self.assertTrue(probe.is_meta)
+
+                non_empty = torch.tensor([1.0, 2.0])
+                self.assertEqual(non_empty.device, torch.device("meta"))
+                self.assertTrue(non_empty.is_meta)
+
+                created = torch.empty((3, 4))
+                self.assertEqual(created.device, torch.device("meta"))
+                self.assertTrue(created.is_meta)
+
+                # Explicit real devices override the ambient meta context.
+                explicit_cpu = torch.linspace(0.0, 1.0, 5, device="cpu")
+                self.assertEqual(explicit_cpu.device.type, "cpu")
+                self.assertFalse(explicit_cpu.is_meta)
+
+                # Nested real-device context overrides outer meta context.
+                with torch.device("cpu"):
+                    nested = torch.tensor([])
+                    self.assertEqual(nested.device.type, "cpu")
+                    self.assertFalse(nested.is_meta)
+
+            # Tensors built under meta keep their meta identity after exit,
+            # while fresh allocations outside the block are on CPU.
+            self.assertEqual(created.device, torch.device("meta"))
+            self.assertTrue(created.is_meta)
+            materialized = torch.empty_like(created, device="cpu")
+            self.assertEqual(materialized.device.type, "cpu")
+            self.assertFalse(materialized.is_meta)
+
+    def test_module_to_empty_clears_meta_mark_on_cpu(self):
+        with jt.flag_scope(use_cuda=0):
+            module = nn.Module()
+            with torch.device("meta"):
+                module.register_buffer("w", torch.empty((2, 3)))
+            self.assertTrue(module.w.is_meta)
+            module.to_empty(device="cpu")
+            self.assertFalse(module.w.is_meta)
+            self.assertEqual(module.w.device.type, "cpu")
