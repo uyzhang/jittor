@@ -6,14 +6,10 @@ import torch
 import torch.nn.functional as F
 
 
-def _devices():
-    devs = ["cpu"]
-    if torch.cuda.is_available():
-        devs.append("cuda")
-    return devs
+_DEVICES = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 def test_missing_public_torch_apis_parity(device):
     # 1. torch.neg
     x = torch.tensor([-2.0, 0.0, 3.5], device=device)
@@ -66,7 +62,7 @@ def test_missing_public_torch_apis_parity(device):
     )
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 def test_namedtuple_return_fields_for_kthvalue_and_slogdet(device):
     x = torch.tensor([[3.0, 1.0, 4.0, 2.0], [9.0, 5.0, 8.0, 6.0]], device=device)
     kv = torch.kthvalue(x, 2, dim=-1)
@@ -86,7 +82,7 @@ def test_namedtuple_return_fields_for_kthvalue_and_slogdet(device):
         np.testing.assert_allclose(float(sd.logabsdet.cpu().item()), np.log(11.0), rtol=1e-5)
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 def test_irfft_histc_cummax_cummin_preserve_device(device):
     # 1. fft.irfft round-trip on CPU & CUDA
     x = torch.randn(4, 16, device=device, dtype=torch.float32)

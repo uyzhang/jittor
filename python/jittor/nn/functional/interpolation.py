@@ -8,7 +8,15 @@ from jittor._core.dtypes import dtype_name
 from jittor._core.var import device_scope_like
 from jittor._runtime.dispatch import dispatch_context, try_dispatch
 from ._layout import channels_last_source, channels_last_view, records_no_grad
-from jittor.backends.cuda.kernels.nn import resize_cuda as _cuda_resize_kernels  # noqa: F401
+
+_CUDA_RESIZE_LOADED = False
+
+
+def _ensure_cuda_resize():
+    global _CUDA_RESIZE_LOADED
+    if not _CUDA_RESIZE_LOADED:
+        _CUDA_RESIZE_LOADED = True
+        from jittor.backends.cuda.kernels.nn import resize_cuda as _cuda_resize_kernels  # noqa: F401
 
 
 def _bicubic(x, a, func):
@@ -249,6 +257,7 @@ def resize(img, size, mode="nearest", align_corners=False, tf_mode=False):
         raise ValueError("unsupported interpolation mode: {}".format(mode))
     if mode == "nearest-exact" and (align_corners or tf_mode):
         raise ValueError("nearest-exact requires align_corners=False and tf_mode=False")
+    _ensure_cuda_resize()
     fast = try_dispatch("nn.resize", img, (H, W), mode, align_corners, tf_mode)
     if fast is not None:
         return fast

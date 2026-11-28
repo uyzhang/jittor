@@ -99,10 +99,10 @@ def environment_for(runtime, options, state):
         for name in JITTOR_VARIABLES + ("JT_BUILD_NVCC_PATH", "nvcc_path"):
             env.pop(name, None)
     else:
-        # Pin this checkout and its torch shim, plus a cache no test run shares.
-        shim_dir = _ensure_checkout_shim(state)
+        # Pin this checkout (and its deployed torch shim when present), plus an isolated cache.
+        shim_dir = state / "shim"
         py_entries = [str(REPO / "python")]
-        if shim_dir is not None:
+        if (shim_dir / "torch" / "__init__.py").is_file():
             py_entries.insert(0, str(shim_dir))
         env["PYTHONPATH"] = os.pathsep.join(py_entries)
         env["JITTOR_HOME"] = str(state / "jittor-home")
@@ -111,6 +111,7 @@ def environment_for(runtime, options, state):
         if options.device == "cpu":
             env["JT_BACKEND"] = "cpu"
             env["JT_USE_CUDA"] = "0"
+            env.pop("use_cuda", None)
             env["CUDA_VISIBLE_DEVICES"] = ""
     if options.gpu is not None:
         visible = "ASCEND_RT_VISIBLE_DEVICES" if options.device == "npu" else "CUDA_VISIBLE_DEVICES"
@@ -148,6 +149,8 @@ def run_one(workload, runtime, options, state, log_dir, mode="none"):
     suffix = "" if mode == "none" else "." + mode
     log = log_dir / ("%s.%s%s.log" % (workload, runtime, suffix))
     print("  %-8s %-16s %s ..." % (runtime, mode, workload), end="", flush=True)
+    if runtime == "jittor":
+        _ensure_checkout_shim(state)
     try:
         completed = subprocess.run(
             command, env=environment_for(runtime, options, state),

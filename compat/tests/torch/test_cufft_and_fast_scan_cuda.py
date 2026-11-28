@@ -5,11 +5,10 @@ import pytest
 import torch
 
 
-def _devices():
-    return ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+_DEVICES = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 def test_fft_ifft_rfft_irfft_fft2_parity(device):
     rng = np.random.RandomState(42)
     x_np = rng.randn(4, 16, 64).astype(np.float32)
@@ -37,7 +36,7 @@ def test_fft_ifft_rfft_irfft_fft2_parity(device):
     np.testing.assert_allclose(f2.imag.cpu().numpy(), ref2.imag, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("dim", [-1, 1, 0])
 def test_cumprod_and_cumsum_forward_backward_parity(device, dim):
     rng = np.random.RandomState(7)

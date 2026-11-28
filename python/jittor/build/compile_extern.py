@@ -176,25 +176,15 @@ def _mkl_obtainable():
             or _onednn_provider.source_build_available(
                 _mkl_root(), manifest.mkl_asset(), manifest.ONEDNN_VERSION, cc_path))
         if not _mkl_obtainable_answer:
-<<<<<<< HEAD
             # Only emit a prominent warning when the user explicitly requested
             # oneDNN; otherwise log verbosely so ordinary CPU runs without cmake
             # do not force users to set JT_BUILD_USE_MKL=0 to stay quiet.
-            explicit_mkl = build_env("use_mkl", None, os.environ)
-            log_fn = LOG.w if explicit_mkl is not None else LOG.v
-            log_fn("use_mkl is on, but oneDNN v3 is not installed and cannot be built "
-                   "here: building it requires cmake, which is not on PATH. CPU matmul "
-                   "and convolution use Jittor's generic kernels. Install cmake, or set "
-                   "JT_BUILD_MKL_INCLUDE_PATH/JT_BUILD_MKL_LIB_PATH, to enable oneDNN; "
-                   "set JT_BUILD_USE_MKL=0 to disable probing.")
-=======
             explicit_mkl = build_env("use_mkl", None, os.environ) is not None
             log_fn = LOG.w if explicit_mkl else LOG.v
             log_fn("oneDNN v3 is not installed (CPU matmul/conv uses OpenBLAS and "
                    "built-in kernels). Run `python -m jittor.build.onednn`, set "
                    "JT_AUTO_BUILD_ONEDNN=1 (requires cmake), or set "
                    "JT_BUILD_MKL_INCLUDE_PATH/JT_BUILD_MKL_LIB_PATH to enable oneDNN.")
->>>>>>> 2d9f29816 (build: make extern deps offline-safe, lazy, and complete cuda13 extra)
     return _mkl_obtainable_answer
 
 

@@ -15,7 +15,15 @@ import operator
 import jittor as jt
 from jittor.misc import _pair, _triple
 from jittor._runtime.dispatch import try_dispatch
-from jittor.backends.cuda.kernels.pooling import avg_pool_cuda as _cuda_avg_pool_kernels  # noqa: F401
+
+_CUDA_AVG_POOL_LOADED = False
+
+
+def _ensure_cuda_avg_pool():
+    global _CUDA_AVG_POOL_LOADED
+    if not _CUDA_AVG_POOL_LOADED:
+        _CUDA_AVG_POOL_LOADED = True
+        from jittor.backends.cuda.kernels.pooling import avg_pool_cuda as _cuda_avg_pool_kernels  # noqa: F401
 
 
 def _pool_output_size(size, kernel, stride, padding, ceil_mode):
@@ -100,11 +108,13 @@ def _avg_pool_nd(x, rank, kernel_size, stride, padding, ceil_mode,
             "kernel {}, stride {}, padding {}.".format(
                 api, tuple(out_sizes), tuple(x.shape), kernel, strides, pads))
     if rank == 2:
+        _ensure_cuda_avg_pool()
         fast = try_dispatch("nn.pool2d", x, kernel, strides, pads, None, False,
                             ceil_mode, count_include_pad, "mean")
         if fast is not None:
             return fast
     elif rank == 3:
+        _ensure_cuda_avg_pool()
         fast = try_dispatch("nn.avg_pool3d", x, kernel, strides, pads,
                             ceil_mode, count_include_pad)
         if fast is not None:
@@ -194,6 +204,7 @@ def adaptive_avg_pool2d(input, output_size):
     if input.ndim == 3:
         return adaptive_avg_pool2d(input.unsqueeze(0), output_size).squeeze(0)
     out_height, out_width = output_size
+    _ensure_cuda_avg_pool()
     dispatched = try_dispatch("nn.adaptive_avg_pool2d", input, output_size)
     if dispatched is not None:
         return dispatched

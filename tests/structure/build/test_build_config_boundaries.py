@@ -240,10 +240,11 @@ def test_compatible_library_loaders_keep_corex_but_not_acl_or_rocm(name):
         pass
     def entered(*args, **kwargs):
         raise EnteredLoader()
+    env_map = {"JT_BUILD_USE_CUTT": "1"} if name == "setup_cutt" else {}
     namespace = {
         "has_cuda": True, "is_cuda": False, "has_corex": False,
         "cuda_wheel_stack": None, "build_env": build_env, "build_flag": build_flag,
-        "setup_fake_cuda_lib": False, "os": SimpleNamespace(environ={}, path=os.path),
+        "setup_fake_cuda_lib": False, "os": SimpleNamespace(environ=env_map, path=os.path),
         "platform": SimpleNamespace(machine=lambda: "x86_64"),
         "LOG": SimpleNamespace(v=entered, vv=entered),
         "jit_utils": SimpleNamespace(home=entered), "library_resource": entered,

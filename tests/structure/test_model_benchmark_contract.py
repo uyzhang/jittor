@@ -128,7 +128,7 @@ class TestModelBenchmarkContract(unittest.TestCase):
         with mock.patch.dict("os.environ", {"JT_USE_CUDA": "1", "use_cuda": "1", "JT_BACKEND": "cuda"}, clear=True):
             jittor = runner.environment_for("jittor", options, Path("state"))
             torch = runner.environment_for("torch", options, Path("state"))
-        self.assertEqual(jittor["use_cuda"], "0")
+        self.assertNotIn("use_cuda", jittor)
         self.assertEqual(jittor["JT_USE_CUDA"], "0")
         self.assertEqual(jittor["JT_BACKEND"], "cpu")
         self.assertNotIn("use_cuda", torch)
@@ -146,7 +146,7 @@ class TestModelBenchmarkContract(unittest.TestCase):
         specs = {row["name"]: row for row in runner.list_workloads()}
         self.assertEqual(specs["qwen3_prefill"]["requires"], ("transformers",))
         self.assertEqual(specs["resnet50_infer_b1"]["default_dtype"], "float16")
-        self.assertEqual(len(specs), 14)
+        self.assertEqual(len(specs), 47)
 
     def test_worker_cannot_report_success_after_crash_or_timeout(self):
         options = SimpleNamespace(torch_python="reference-python", jittor_python="jittor-python",
