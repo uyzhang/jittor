@@ -67,7 +67,6 @@ cufftHandle cufft_get_plan(const CufftPlanKey& key) {
     }
 
     cache.reserve_one(cufft_max_cache_size);
-    int n[2] = {(int)key.n0, (int)key.n1};
     std::unique_ptr<CufftDeviceCache::Plan> plan(new CufftDeviceCache::Plan(&cache));
     // MakePlanMany initializes this existing handle (unlike PlanMany, which
     // creates another one). The owner is armed before workspace setup so a
@@ -75,9 +74,17 @@ cufftHandle cufft_get_plan(const CufftPlanKey& key) {
     CUFFT_CALL(cufftCreate(&plan->value));
     plan->ready = true;
     size_t workspace = 0;
-    CUFFT_CALL(cufftMakePlanMany(plan->value, 2, n,
-        nullptr, 1, n[0] * n[1], nullptr, 1, n[0] * n[1],
-        (cufftType)key.type, (int)key.batch, &workspace));
+    if (key.n0 == 1) {
+        int n1[1] = {(int)key.n1};
+        CUFFT_CALL(cufftMakePlanMany(plan->value, 1, n1,
+            nullptr, 1, n1[0], nullptr, 1, n1[0],
+            (cufftType)key.type, (int)key.batch, &workspace));
+    } else {
+        int n[2] = {(int)key.n0, (int)key.n1};
+        CUFFT_CALL(cufftMakePlanMany(plan->value, 2, n,
+            nullptr, 1, n[0] * n[1], nullptr, 1, n[0] * n[1],
+            (cufftType)key.type, (int)key.batch, &workspace));
+    }
     CUFFT_CALL(cufftSetStream(plan->value, cache.stream));
     cache.binds++;
     return cache.publish(key, std::move(plan));

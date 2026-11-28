@@ -404,7 +404,313 @@ def unique_compact_source(need_inverse):
 
 
 
+_SCAN_STRIDED_HEADER = r"""
+#include <type/fp16_compute.h>
+
+template <typename T, typename AccT, int REVERSE>
+__global__ void _jt_cumsum_strided_k(
+    const T* __restrict__ xp,
+    T* __restrict__ yp,
+    int64_t outer, int64_t dim_size, int64_t inner
+) {
+    const int64_t total_fibers = outer * inner;
+    for (int64_t f = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         f < total_fibers;
+         f += (int64_t)gridDim.x * blockDim.x) {
+        const int64_t o = f / inner;
+        const int64_t in_i = f - o * inner;
+        const int64_t base = o * dim_size * inner + in_i;
+        AccT acc = (AccT)0;
+        if (REVERSE) {
+            for (int64_t k = dim_size - 1; k >= 0; --k) {
+                acc = acc + (AccT)xp[base + k * inner];
+                yp[base + k * inner] = (T)acc;
+            }
+        } else {
+            for (int64_t k = 0; k < dim_size; ++k) {
+                acc = acc + (AccT)xp[base + k * inner];
+                yp[base + k * inner] = (T)acc;
+            }
+        }
+    }
+}
+
+template <typename T, typename AccT>
+__global__ void _jt_cumprod_warp_k(
+    const T* __restrict__ xp,
+    T* __restrict__ yp,
+    int64_t rows, int64_t width
+) {
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const int64_t total_warps = (int64_t)gridDim.x * warps_per_block;
+    for (int64_t row = (int64_t)blockIdx.x * warps_per_block + warp_in_block;
+         row < rows;
+         row += total_warps) {
+        const int64_t row_start = row * width;
+        AccT carry = (AccT)1;
+        for (int64_t tile = 0; tile < width; tile += 32) {
+            const int64_t col = tile + lane;
+            const bool active = col < width;
+            AccT v = active ? (AccT)xp[row_start + col] : (AccT)1;
+            #pragma unroll
+            for (int delta = 1; delta < 32; delta <<= 1) {
+                AccT n = __shfl_up_sync(0xffffffffu, v, delta);
+                if (lane >= delta) v = v * n;
+            }
+            v = v * carry;
+            if (active) yp[row_start + col] = (T)v;
+            carry = __shfl_sync(0xffffffffu, v, 31);
+        }
+    }
+}
+
+template <typename T, typename AccT>
+__global__ void _jt_cumprod_strided_k(
+    const T* __restrict__ xp,
+    T* __restrict__ yp,
+    int64_t outer, int64_t dim_size, int64_t inner
+) {
+    const int64_t total_fibers = outer * inner;
+    for (int64_t f = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         f < total_fibers;
+         f += (int64_t)gridDim.x * blockDim.x) {
+        const int64_t o = f / inner;
+        const int64_t in_i = f - o * inner;
+        const int64_t base = o * dim_size * inner + in_i;
+        AccT acc = (AccT)1;
+        for (int64_t k = 0; k < dim_size; ++k) {
+            acc = acc * (AccT)xp[base + k * inner];
+            yp[base + k * inner] = (T)acc;
+        }
+    }
+}
+
+// Exact, division-free, zero-safe O(D) cumprod backward recurrence:
+//   S_{D-1} = g_{D-1},   S_i = g_i + x_{i+1} * S_{i+1}
+//   dx_i = y_{i-1} * S_i   (with y_{-1} = 1).
+template <typename T, typename AccT>
+__global__ void _jt_cumprod_bwd_k(
+    const T* __restrict__ xp,
+    const T* __restrict__ yp,
+    const T* __restrict__ gp,
+    T* __restrict__ dxp,
+    int64_t outer, int64_t dim_size, int64_t inner
+) {
+    const int64_t total_fibers = outer * inner;
+    for (int64_t f = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         f < total_fibers;
+         f += (int64_t)gridDim.x * blockDim.x) {
+        const int64_t o = f / inner;
+        const int64_t in_i = f - o * inner;
+        const int64_t base = o * dim_size * inner + in_i;
+        AccT suffix = (AccT)0;
+        for (int64_t k = dim_size - 1; k >= 0; --k) {
+            const int64_t idx = base + k * inner;
+            AccT g = (AccT)gp[idx];
+            if (k == dim_size - 1) {
+                suffix = g;
+            } else {
+                suffix = g + (AccT)xp[idx + inner] * suffix;
+            }
+            AccT excl = (k == 0) ? (AccT)1 : (AccT)yp[idx - inner];
+            dxp[idx] = (T)(excl * suffix);
+        }
+    }
+}
+"""
+
+
+def _cumsum_strided_cuda_code(x, outer, dim_size, inner, reverse):
+    from jittor._core.dtypes import dtype_name as _dtype_name
+    dname = _dtype_name(x.dtype)
+    acc_t = "float" if dname in ("float16", "bfloat16") else "in0_type"
+    rev_flag = 1 if reverse else 0
+    x3 = x.contiguous().reshape([outer, dim_size, inner])
+    y3 = jt.code(
+        x3.shape,
+        x3.dtype,
+        [x3],
+        cuda_header=_SCAN_STRIDED_HEADER,
+        cuda_src=f'''
+        const int64_t outer = (int64_t)in0->shape[0];
+        const int64_t dim_size = (int64_t)in0->shape[1];
+        const int64_t inner = (int64_t)in0->shape[2];
+        const int64_t total_fibers = outer * inner;
+        if (total_fibers > 0 && dim_size > 0) {{
+            constexpr int threads = 256;
+            const int64_t raw_blocks = (total_fibers + threads - 1) / threads;
+            const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+            _jt_cumsum_strided_k<in0_type, {acc_t}, {rev_flag}><<<blocks, threads>>>(
+                in0_p, out0_p, outer, dim_size, inner);
+            CHECK(0 == cudaGetLastError());
+        }}
+        ''',
+    )
+    return y3.reshape(x.shape)
+
+
+class _CumsumStridedCuda(jt.Function):
+    def __init__(self, outer, dim_size, inner, reverse=False):
+        self.outer = outer
+        self.dim_size = dim_size
+        self.inner = inner
+        self.reverse = reverse
+
+    def execute(self, x):
+        return _cumsum_strided_cuda_code(
+            x, self.outer, self.dim_size, self.inner, self.reverse
+        )
+
+    def grad(self, g):
+        if g is None:
+            return None
+        from jittor._core.var import device_scope_like
+        with device_scope_like(g):
+            return _CumsumStridedCuda(
+                self.outer, self.dim_size, self.inner, not self.reverse
+            )(g)
+
+
+def _cumsum_cuda_fast(x, dim):
+    if x.dtype.is_complex() or x.numel() == 0 or x.ndim <= 1:
+        return None
+    if dim == x.ndim - 1:
+        return None
+    outer = 1
+    for s in x.shape[:dim]:
+        outer *= int(s)
+    dim_size = int(x.shape[dim])
+    inner = 1
+    for s in x.shape[dim + 1:]:
+        inner *= int(s)
+    if inner <= 1 or dim_size > 2048 or outer * inner < 32:
+        return None
+    if jt.flags.no_grad:
+        from jittor._core.var import device_scope_like
+        with device_scope_like(x):
+            return _cumsum_strided_cuda_code(x, outer, dim_size, inner, False)
+    from jittor._core.var import device_scope_like
+    with device_scope_like(x):
+        return _CumsumStridedCuda(outer, dim_size, inner, False)(x)
+
+
+def _cumprod_fwd_cuda_code(x, outer, dim_size, inner):
+    from jittor._core.dtypes import dtype_name as _dtype_name
+    dname = _dtype_name(x.dtype)
+    acc_t = "float" if dname in ("float16", "bfloat16") else "in0_type"
+    x3 = x.contiguous().reshape([outer, dim_size, inner])
+    y3 = jt.code(
+        x3.shape,
+        x3.dtype,
+        [x3],
+        cuda_header=_SCAN_STRIDED_HEADER,
+        cuda_src=f'''
+        const int64_t outer = (int64_t)in0->shape[0];
+        const int64_t dim_size = (int64_t)in0->shape[1];
+        const int64_t inner = (int64_t)in0->shape[2];
+        const int64_t total_fibers = outer * inner;
+        if (total_fibers > 0 && dim_size > 0) {{
+            if (inner == 1 && dim_size <= 256) {{
+                const int64_t raw_blocks = (outer + 7) / 8;
+                const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                _jt_cumprod_warp_k<in0_type, {acc_t}><<<blocks, 256>>>(in0_p, out0_p, outer, dim_size);
+            }} else {{
+                constexpr int threads = 256;
+                const int64_t raw_blocks = (total_fibers + threads - 1) / threads;
+                const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                _jt_cumprod_strided_k<in0_type, {acc_t}><<<blocks, threads>>>(
+                    in0_p, out0_p, outer, dim_size, inner);
+            }}
+            CHECK(0 == cudaGetLastError());
+        }}
+        ''',
+    )
+    return y3.reshape(x.shape)
+
+
+def _cumprod_bwd_cuda_code(x, y, dout, outer, dim_size, inner):
+    from jittor._core.dtypes import dtype_name as _dtype_name
+    dname = _dtype_name(x.dtype)
+    acc_t = "float" if dname in ("float16", "bfloat16") else "in0_type"
+    x3 = x.contiguous().reshape([outer, dim_size, inner])
+    y3 = y.contiguous().reshape([outer, dim_size, inner])
+    g3 = dout.contiguous().reshape([outer, dim_size, inner])
+    dx3 = jt.code(
+        x3.shape,
+        x3.dtype,
+        [x3, y3, g3],
+        cuda_header=_SCAN_STRIDED_HEADER,
+        cuda_src=f'''
+        const int64_t outer = (int64_t)in0->shape[0];
+        const int64_t dim_size = (int64_t)in0->shape[1];
+        const int64_t inner = (int64_t)in0->shape[2];
+        const int64_t total_fibers = outer * inner;
+        if (total_fibers > 0 && dim_size > 0) {{
+            constexpr int threads = 256;
+            const int64_t raw_blocks = (total_fibers + threads - 1) / threads;
+            const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+            _jt_cumprod_bwd_k<in0_type, {acc_t}><<<blocks, threads>>>(
+                in0_p, in1_p, in2_p, out0_p, outer, dim_size, inner);
+            CHECK(0 == cudaGetLastError());
+        }}
+        ''',
+    )
+    return dx3.reshape(x.shape)
+
+
+class _CumprodCuda(jt.Function):
+    def __init__(self, outer, dim_size, inner):
+        self.outer = outer
+        self.dim_size = dim_size
+        self.inner = inner
+
+    def execute(self, x):
+        xc = x.contiguous()
+        y = _cumprod_fwd_cuda_code(xc, self.outer, self.dim_size, self.inner)
+        self.saved = (xc, y)
+        return y
+
+    def grad(self, g):
+        if g is None:
+            return None
+        from jittor._core.var import device_scope_like
+        xc, y = self.saved
+        with device_scope_like(g):
+            return _cumprod_bwd_cuda_code(xc, y, g, self.outer, self.dim_size, self.inner)
+
+
+def _cumprod_cuda_fast(x, dim):
+    from jittor._core.dtypes import dtype_name as _dtype_name
+    dname = _dtype_name(x.dtype)
+    if dname not in ("float32", "float64", "float16", "bfloat16", "int32", "int64"):
+        return None
+    if x.numel() == 0:
+        return None
+    if x.ndim == 0:
+        return x.clone()
+    outer = 1
+    for s in x.shape[:dim]:
+        outer *= int(s)
+    dim_size = int(x.shape[dim])
+    inner = 1
+    for s in x.shape[dim + 1:]:
+        inner *= int(s)
+    if dim_size > 4096:
+        return None
+    if jt.flags.no_grad:
+        from jittor._core.var import device_scope_like
+        with device_scope_like(x):
+            return _cumprod_fwd_cuda_code(x, outer, dim_size, inner)
+    from jittor._core.var import device_scope_like
+    with device_scope_like(x):
+        return _CumprodCuda(outer, dim_size, inner)(x)
+
+
 for _backend in _CUDA_CODE_BACKENDS:
     register_kernel("misc.unique_code", _backend, _unique_code_cuda)
     register_kernel("misc.scan_2d", _backend, _scan_2d_cuda)
+    register_kernel("tensor.cumsum", _backend, _cumsum_cuda_fast)
+    register_kernel("tensor.cumprod", _backend, _cumprod_cuda_fast)
 del _backend

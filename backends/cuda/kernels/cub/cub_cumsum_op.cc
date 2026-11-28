@@ -54,6 +54,10 @@ void CubCumsumOp::jit_prepare(JK& jk) {
     // generated `#define` as "200" (0x200) and the kernel ran with a
     // 200-thread block instead of 512. Only `=` runs hex_to_dec on the value.
     jk << "«BLOCK_THREADS=" << JK::hex(x->dsize() >= 8 ? 512 : 1024);
+    jk << "«WARP_SCAN=" << JK::hex(
+        x->dtype() == ns_float32 || x->dtype() == ns_float64 ||
+        x->dtype() == ns_int32 || x->dtype() == ns_int64 ||
+        x->dtype() == ns_uint32 || x->dtype() == ns_uint64);
     jk << "«WIDE_SCAN=" << JK::hex(
         x->dtype() == ns_float32 && construction_target_backend(x) == BackendId::Cuda);
 }
@@ -114,6 +118,46 @@ __global__ void BlockScanKernel(const Tx* __restrict__ xp, Ty* __restrict__ yp, 
     }
 }
 
+#if WARP_SCAN
+// One 32-lane warp per row for short rows (width <= 128): 8 warps = 256 threads
+// per block, zero shared memory, zero __syncthreads(), pure warp-shuffle scan.
+__global__ void WarpScanKernel(const Tx* __restrict__ xp, Ty* __restrict__ yp, int rows, int width) {
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const int64_t total_warps = int64_t(gridDim.x) * warps_per_block;
+    for (int64_t row = int64_t(blockIdx.x) * warps_per_block + warp_in_block;
+         row < rows;
+         row += total_warps) {
+        const int64_t row_start = row * width;
+        Tx carry = Tx(0);
+        for (int tile = 0; tile < width; tile += 32) {
+            const int col = tile + lane;
+            const bool active = col < width;
+            #if reverse
+            Tx v = active ? xp[row_start + width - 1 - col] : Tx(0);
+            #else
+            Tx v = active ? xp[row_start + col] : Tx(0);
+            #endif
+            #pragma unroll
+            for (int delta = 1; delta < 32; delta <<= 1) {
+                Tx n = __shfl_up_sync(0xffffffffu, v, delta);
+                if (lane >= delta) v += n;
+            }
+            v += carry;
+            if (active) {
+                #if reverse
+                yp[row_start + width - 1 - col] = v;
+                #else
+                yp[row_start + col] = v;
+                #endif
+            }
+            carry = __shfl_sync(0xffffffffu, v, 31);
+        }
+    }
+}
+#endif
+
 #if WIDE_SCAN
 struct WideScanRowKey {
     int width;
@@ -160,6 +204,16 @@ void CubCumsumOp::jit_run() {
     #if WIDE_SCAN
     if (rows >= 2 && rows <= 8 && width >= 32768 && int64_t(rows) * width <= 2 * 1024 * 1024) {
         scan_wide_rows(xp, yp, rows, width);
+        return;
+    }
+    #endif
+
+    // Short rows waste >85% of a 1024-thread block; pack 8 rows per 256-thread
+    // block with register warp shuffles and no __syncthreads().
+    #if WARP_SCAN
+    if (!vector && rows >= 8 && width <= 128) {
+        const int blocks = std::min((rows + 7) / 8, 65535);
+        WarpScanKernel<<<blocks, 256>>>(xp, yp, rows, width);
         return;
     }
     #endif
