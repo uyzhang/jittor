@@ -101,6 +101,19 @@ class TestStage2Delivery(unittest.TestCase):
         self.assertIn("fromJSON(needs.baseline.outputs.release_platform_matrix)", release)
         self.assertIn("canonical wheel must be universal", release)
         self.assertIn("-py3-none-any.whl", release)
+        # Core `jittor` wheel no longer bundles `jittor-compat` or removed
+        # `torch_init.py`; release verification must check core wheel members.
+        self.assertIn("jittor/src/core/common.h", release)
+        self.assertNotIn("torch_init.py", release)
+        self.assertNotIn("jittor/compat/", release)
+        self.assertIn('JT_BUILD_NVCC_PATH=""', release)
+        self.assertNotIn('nvcc_path=""', release)
+
+        cpu_workflow = (self.workflows / "cpu.yml").read_text(encoding="utf-8")
+        self.assertIn("ci:full", cpu_workflow)
+        self.assertIn("2.0-refactor", containers)
+        self.assertIn('"src/**"', containers)
+        self.assertIn('"backends/**"', containers)
 
     @staticmethod
     def _cpu_gate_files():

@@ -336,6 +336,7 @@ def test_pytest_owns_collection_and_strict_xfail_policy():
         "network",
         "manual",
         "load_sensitive",
+        "xdist_group",
     }
 
 
@@ -428,12 +429,14 @@ def test_complete_suite_runner_owns_cpu_and_process_mode_environment(monkeypatch
         assert environment["nvcc_path"] == ""
         assert environment["JITTOR_TEST_DEVICES"] == "cpu"
         # Owned, not inherited: the caller exported 1 above and the runner
-        # decides. The value is now the gate's own default rather than 0 --
-        # this script used to force the parallel op compiler off, which made it
-        # time a configuration `nox -s cpu` never runs.
-        assert environment["use_parallel_op_compiler"] == "16"
+        # decides using the canonical JT_USE_PARALLEL_OP_COMPILER name (dropping
+        # the deprecated unprefixed alias so the session emits no deprecation
+        # warning).
+        assert environment["JT_USE_PARALLEL_OP_COMPILER"] == "16"
+        assert "use_parallel_op_compiler" not in environment
     # ...and --serial-compile is a stated override, not the inherited value.
-    assert serial["use_parallel_op_compiler"] == "0"
+    assert serial["JT_USE_PARALLEL_OP_COMPILER"] == "0"
+    assert "use_parallel_op_compiler" not in serial
     assert native["REAL_TORCH_SITE"] == "/inherited/torch"
     assert serial["REAL_TORCH_SITE"] == "/inherited/torch"
     assert torch["REAL_TORCH_SITE"] == ""

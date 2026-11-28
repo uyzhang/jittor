@@ -1,6 +1,7 @@
 """Unavailable benchmark parameters must not hide broken installations or kernels."""
 
 import ast
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -99,6 +100,8 @@ class TestAsvEntryPoints(unittest.TestCase):
             _configure_device(backend, "npu")
 
     def test_source_config_is_executable_without_nox_path_rewriting(self):
+        if importlib.util.find_spec("asv") is None:
+            self.skipTest("asv (requirements/dev-tools.txt) is not installed here")
         environment = dict(os.environ)
         environment.pop("ASV_CONF_DIR", None)
         result = run_python_child([

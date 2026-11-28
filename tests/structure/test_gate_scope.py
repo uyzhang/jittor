@@ -301,6 +301,11 @@ def test_local_runner_matches_gate_execution_contract():
         else:
             os.environ["JT_BUILD_NVCC_PATH"] = previous
     assert cpu["JT_BUILD_NVCC_PATH"] == cpu["nvcc_path"] == ""
+    assert cpu["JT_USE_PARALLEL_OP_COMPILER"] == "16"
+    assert "use_parallel_op_compiler" not in cpu
+    if "gdb_path" not in os.environ:
+        assert cpu["JT_GDB_PATH"] == ""
+        assert "gdb_path" not in cpu
     # Both halves the docstring claims, and which one this checkout can be
     # asked depends on a declared dev tool. Without pytest-xdist the runner
     # must refuse rather than run serially and report a wall clock for a gate

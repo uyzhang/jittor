@@ -50,7 +50,6 @@ jobs:
       JT_BACKEND: cpu
       JT_USE_CUDA: '0'
       JT_BUILD_NVCC_PATH: ''
-      nvcc_path: ''
       JT_BUILD_USE_MKL: '0'
       JT_BUILD_USE_MPI: '0'
       JT_BUILD_USE_NCCL: '0'

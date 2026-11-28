@@ -158,9 +158,9 @@ jobs:
                   % (expected_version, installed.version)
               )
           required = (
-              "jittor/compat/shim/cpp_extension/include/ATen/cuda/detail/UnpackRaw.cuh",
-              "jittor/compat/shim/resources/stubs/flash_attn/flash_attn_interface.py",
-              "jittor/compat/shim/resources/torch_init.py",
+              "jittor/src/core/common.h",
+              "jittor/backends/cuda/__init__.py",
+              "jittor/build/compiler.py",
           )
           for relative in required:
               if not installed.locate_file(relative).is_file():
@@ -184,7 +184,7 @@ jobs:
           # Out of the checkout: importing from the repository root picks up
           # ./python/jittor and tests the source tree instead of the wheel.
           cd "${RUNNER_TEMP}"
-          nvcc_path="" python -m jittor.selftest
+          JT_BUILD_NVCC_PATH="" python -m jittor.selftest
         env:
           JITTOR_HOME: ${{ runner.temp }}/jittor-home
 
