@@ -114,6 +114,53 @@ def _stable_expm1(input):
     return jt.ternary(input < -1.0, tail, near)
 
 
+def _pool1d_scalar(value):
+    if isinstance(value, (tuple, list)):
+        if len(value) != 1:
+            raise ValueError("pool1d expects a 1-element tuple or int, got %r" % (value,))
+        return value[0]
+    return value
+
+
+def _max_pool1d(input, kernel_size, stride=None, padding=0, dilation=1,
+                ceil_mode=False, return_indices=False):
+    from jittor.nn.functional.pooling.pooling_1d import (
+        _max_pool1d as _native_max_pool1d,
+        _max_pool1d_parameters,
+    )
+    from ...frontend import tensor_frontend
+    from ...tensor_state import compatibility_owner
+    params = _max_pool1d_parameters(
+        _pool1d_scalar(kernel_size),
+        None if stride is None else _pool1d_scalar(stride),
+        _pool1d_scalar(padding),
+        _pool1d_scalar(dilation),
+        return_indices,
+        ceil_mode,
+    )
+    with tensor_frontend(compatibility_owner(jt).Var, device=input.device):
+        return _native_max_pool1d(input, **params)
+
+
+def _avg_pool1d(input, kernel_size, stride=None, padding=0, ceil_mode=False,
+                count_include_pad=True):
+    from jittor.nn.functional.pooling.pooling_1d import (
+        _avg_pool1d as _native_avg_pool1d,
+        _avg_pool1d_parameters,
+    )
+    from ...frontend import tensor_frontend
+    from ...tensor_state import compatibility_owner
+    params = _avg_pool1d_parameters(
+        _pool1d_scalar(kernel_size),
+        None if stride is None else _pool1d_scalar(stride),
+        _pool1d_scalar(padding),
+        ceil_mode,
+        count_include_pad,
+    )
+    with tensor_frontend(compatibility_owner(jt).Var, device=input.device):
+        return _native_avg_pool1d(input, **params)
+
+
 def _threshold(input, threshold, value, inplace=False):
     m = (input > threshold).float32()
     return m * input + (1 - m) * value
@@ -442,6 +489,10 @@ def _install_functional(ctx):
     F.hardtanh = _hardtanh
     if not hasattr(F, "threshold"):
         F.threshold = _threshold
+    if not hasattr(F, "max_pool1d"):
+        F.max_pool1d = _max_pool1d
+    if not hasattr(F, "avg_pool1d"):
+        F.avg_pool1d = _avg_pool1d
     if not hasattr(F, "triplet_margin_loss"):
         F.triplet_margin_loss = _triplet
     if not hasattr(F, "poisson_nll_loss"):
@@ -472,7 +523,7 @@ def _install_functional(ctx):
     })
 
     register_api_bindings(F, 'torch.nn.functional',
-        ('celu', 'cross_entropy', 'ctc_loss', 'embedding', 'gelu', 'gumbel_softmax', 'hardtanh', 'interpolate', 'layer_norm', 'linear', 'log_softmax', 'logsigmoid', 'pixel_shuffle', 'pixel_unshuffle', 'poisson_nll_loss', 'relu', 'rms_norm', 'selu', 'softmax', 'softmin', 'tanhshrink', 'threshold', 'triplet_margin_loss') + tuple(()),
+        ('avg_pool1d', 'celu', 'cross_entropy', 'ctc_loss', 'embedding', 'gelu', 'gumbel_softmax', 'hardtanh', 'interpolate', 'layer_norm', 'linear', 'log_softmax', 'logsigmoid', 'max_pool1d', 'pixel_shuffle', 'pixel_unshuffle', 'poisson_nll_loss', 'relu', 'rms_norm', 'selu', 'softmax', 'softmin', 'tanhshrink', 'threshold', 'triplet_margin_loss') + tuple(()),
         Fidelity.APPROXIMATE, 'Native neural-network mathematics with Torch argument adaptation; dtype, backend, and optional parameter restrictions apply')
     register_api_bindings(F, "torch.nn.functional",
         ("binary_cross_entropy", "cosine_embedding_loss", "gaussian_nll_loss",

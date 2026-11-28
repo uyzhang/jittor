@@ -1478,14 +1478,32 @@ def install_parity(ctx):
     # matching precision; the native eig hands back legacy complex64 pairs.
     from .linalg import eig
     linalg.eig = eig
-    from .linalg import det, slogdet, eigh, eigvalsh, qr
+    from .linalg import (
+        det, slogdet, eigh, eigvalsh, qr, cross,
+        dot, inner, neg, bitwise_left_shift, bitwise_right_shift,
+    )
     linalg.det = det
     linalg.slogdet = slogdet
     linalg.eigh = eigh
     linalg.eigvalsh = eigvalsh
     linalg.qr = qr
+    linalg.cross = cross
     register_fidelity("torch.linalg.qr", qr, Fidelity.APPROXIMATE,
                       "Native reduced, complete, and R-only QR with named factors.")
+    register_fidelity("torch.linalg.cross", cross, Fidelity.APPROXIMATE,
+                      "3-element vector cross product backed by native jt.cross.")
+    for _pub_name, _pub_fn in (
+        ("dot", dot),
+        ("inner", inner),
+        ("neg", neg),
+        ("bitwise_left_shift", bitwise_left_shift),
+        ("bitwise_right_shift", bitwise_right_shift),
+    ):
+        _bind_missing(g, _pub_name, _pub_fn)
+        register_fidelity(
+            "torch." + _pub_name, _pub_fn, Fidelity.APPROXIMATE,
+            "Native-backed Torch operator with frontend result types.",
+        )
     registry.publish("torch.linalg", linalg)
     g.linalg = linalg
 

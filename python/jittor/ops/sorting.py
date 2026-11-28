@@ -1,5 +1,6 @@
 """Sorting tensor operations."""
 
+import collections as _collections
 from jittor_core import Var
 from .. import _arg_policy
 from .._runtime.dispatch import select_kernel
@@ -353,6 +354,9 @@ def _kthvalue_argsort(input, dim):
     return jt.argsort(input, dim=dim)
 
 
+_KthValueResult = _collections.namedtuple("kthvalue", ["values", "indices"])
+
+
 def kthvalue(input, k, dim=None, keepdim=False, keepdims=False):
     import jittor as jt
     keepdim = keepdim or keepdims
@@ -375,4 +379,4 @@ def kthvalue(input, k, dim=None, keepdim=False, keepdims=False):
     if not keepdim and indices.ndim>1:
         indices = indices.squeeze(dim)
         values = values.squeeze(dim)
-    return values,indices
+    return _KthValueResult(values, indices)

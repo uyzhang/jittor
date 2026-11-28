@@ -4,6 +4,7 @@ from collections import namedtuple
 
 
 _QRFactors = namedtuple("linalg_qr", ("Q", "R"))
+_SlogdetResult = namedtuple("linalg_slogdet", ("sign", "logabsdet"))
 
 def eye(n, m=None, dtype=None, device=None, requires_grad=False, out=None, **kwargs):
     """Create a square or rectangular identity matrix, on ``device``.
@@ -123,11 +124,96 @@ def det(input):
 
 
 def slogdet(input):
-    """torch.linalg.slogdet: (sign, logabsdet), each shaped ``input.shape[:-2]``."""
+    """torch.linalg.slogdet: namedtuple(sign, logabsdet), each shaped ``input.shape[:-2]``."""
     import jittor.linalg as native_linalg
     sign, logabsdet = native_linalg.slogdet(input)
     shape = tuple(input.shape[:-2])
-    return sign.reshape(shape), logabsdet.reshape(shape)
+    return _SlogdetResult(sign.reshape(shape), logabsdet.reshape(shape))
+
+
+def _run_in_frontend(fn, *args, **kwargs):
+    from . import jt
+    from ...frontend import tensor_frontend
+    from ...tensor_state import compatibility_owner
+    target = compatibility_owner(jt)
+    with tensor_frontend(target.Var):
+        return fn(*args, **kwargs)
+
+
+def dot(input, tensor, *, out=None):
+    """torch.dot: 1-D inner product returning a 0-D scalar tensor."""
+    from . import jt
+    if input.ndim != 1 or tensor.ndim != 1:
+        raise RuntimeError(
+            "1D tensors expected, but got %dD and %dD tensors"
+            % (input.ndim, tensor.ndim))
+    if int(input.shape[0]) != int(tensor.shape[0]):
+        raise RuntimeError(
+            "inconsistent tensor size, expected tensor [%d] and src [%d] to have the same number of elements"
+            % (int(input.shape[0]), int(tensor.shape[0])))
+    result = _run_in_frontend(lambda a, b: jt.sum(a * b).reshape(()), input, tensor)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def inner(input, other, *, out=None):
+    """torch.inner: sum product over the last dimension of both inputs."""
+    from . import jt
+    if input.ndim == 0 or other.ndim == 0:
+        result = _run_in_frontend(lambda a, b: a * b, input, other)
+    else:
+        if int(input.shape[-1]) != int(other.shape[-1]):
+            raise RuntimeError(
+                "inner: last dimensions must match, got %d and %d"
+                % (int(input.shape[-1]), int(other.shape[-1])))
+        result = _run_in_frontend(
+            lambda a, b: jt.tensordot(a, b, dims=([-1], [-1])), input, other)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def cross(input, other, *, dim=-1, out=None):
+    """torch.linalg.cross: 3-element vector cross product along ``dim``."""
+    from . import jt
+    result = _run_in_frontend(jt.cross, input, other, dim=dim)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def neg(input, *, out=None):
+    """torch.neg: alias for torch.negative with optional ``out=``."""
+    from . import jt
+    result = _run_in_frontend(jt.negative, input)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def bitwise_left_shift(input, other, *, out=None):
+    """torch.bitwise_left_shift backed by native ``jt.left_shift``."""
+    from . import jt
+    result = _run_in_frontend(jt.left_shift, input, other)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def bitwise_right_shift(input, other, *, out=None):
+    """torch.bitwise_right_shift backed by native ``jt.right_shift``."""
+    from . import jt
+    result = _run_in_frontend(jt.right_shift, input, other)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def inverse(input):

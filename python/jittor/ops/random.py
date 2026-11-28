@@ -247,6 +247,10 @@ def histc(input, bins, min=0., max=0.):
         raise RuntimeError(f"bins must be > 0, but got {bins}")
     bin_length = (max - min) / bins
     histc = jt.floor((input[jt.logical_and(input >= min, input < max)] - min) / bin_length).int().reshape(-1)
-    hist = jt.ones_like(histc).float().reindex_reduce("add", [bins,], ["@e0(i0)"], extras=[histc])
+    # Build the unit weights from ``histc`` itself so they always share
+    # ``input``'s backend and device (avoiding a CPU/CUDA mismatch under
+    # Torch frontend placement scopes).
+    ones = histc.float32() * 0.0 + 1.0
+    hist = ones.reindex_reduce("add", [bins,], ["@e0(i0)"], extras=[histc])
     hist[-1] += input[input == max].shape[0]
     return hist
