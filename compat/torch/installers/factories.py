@@ -19,8 +19,8 @@ import jittor as jt
 import numpy as np
 
 from ..types import (
-    _device_is_cpu, _device_is_cuda, _dtype_to_str, _make_cpu_resident,
-    _make_cuda_resident,
+    _device_is_cpu, _device_is_cuda, _dtype_to_str,
+    _make_cpu_resident, _make_cuda_resident, in_meta_device_context,
 )
 from ..nested import _torch_register_leaf
 from ..tensor_layout import CHANNELS_LAST_3D, empty_channels_last_3d
@@ -101,7 +101,13 @@ def _invoke_factory(name, args, kwargs):
             if isinstance(value, jt.Var):
                 requested = "cuda" if value.is_cuda else "cpu"
                 break
-    meta = _is_meta_device_request(requested)
+    meta = _is_meta_device_request(requested) or (
+        requested is None
+        and (
+            (like is None and in_meta_device_context())
+            or (isinstance(like, jt.Var) and getattr(like, "_jittor_torch_meta", False))
+        )
+    )
     if not meta and name in ("empty", "empty_like"):
         result = _fresh_cuda_empty(context.target_namespace, name, implementation, args,
                                    kwargs, requested, like)

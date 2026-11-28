@@ -348,10 +348,11 @@ class device:
     # are built on, and jittor now has a current device that means exactly
     # that. A bare "cuda" still names the current device, so it stays a no-op.
     def __enter__(self):
+        _device_stack("all_stack").append(self)
         if self.type == "meta":
             _DEVICE_CTX_STACK.append(self)
             return self
-        _default_device_stack().append(self)
+        _device_stack().append(self)
         if self.type in ("cuda", "npu") and self.index is not None:
             try:
                 self._prev_index = int(jt.current_device())
@@ -364,13 +365,12 @@ class device:
         return self
 
     def __exit__(self, *exc):
-        if self.type == "meta":
-            if _DEVICE_CTX_STACK and _DEVICE_CTX_STACK[-1] is self:
-                _DEVICE_CTX_STACK.pop()
-        else:
-            stack = _default_device_stack()
-            if stack and stack[-1] is self:
-                stack.pop()
+        all_stack = _device_stack("all_stack")
+        if all_stack and all_stack[-1] is self:
+            all_stack.pop()
+        target = _DEVICE_CTX_STACK if self.type == "meta" else _device_stack()
+        if target and target[-1] is self:
+            target.pop()
         prev = getattr(self, "_prev_index", None)
         if prev is not None and prev >= 0:
             try:
@@ -393,12 +393,17 @@ _DEVICE_CTX_STACK: typing.List[device] = []
 _DEFAULT_DEVICE_CONTEXT = threading.local()
 
 
-def _default_device_stack() -> typing.List[device]:
-    stack = getattr(_DEFAULT_DEVICE_CONTEXT, "stack", None)
+def _device_stack(attr="stack") -> typing.List[device]:
+    stack = getattr(_DEFAULT_DEVICE_CONTEXT, attr, None)
     if stack is None:
         stack = []
-        _DEFAULT_DEVICE_CONTEXT.stack = stack
+        setattr(_DEFAULT_DEVICE_CONTEXT, attr, stack)
     return stack
+
+
+def in_meta_device_context() -> bool:
+    stack = getattr(_DEFAULT_DEVICE_CONTEXT, "all_stack", None)
+    return bool(stack and getattr(stack[-1], "type", None) == "meta")
 
 
 def active_device_context() -> typing.Optional[device]:

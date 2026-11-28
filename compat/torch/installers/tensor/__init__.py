@@ -28,11 +28,11 @@ from ...nested import _NestedTensor, _rebuild_var_from_numpy, _TorchSize, _torch
 from ...tensor_state import get_tensor_state
 from ...tensor_layout import CHANNELS_LAST_3D
 
-from ..factories import _install_random_and_linspace, _set_use_cuda, _wrap_constructors
+from ..factories import _install_random_and_linspace, _is_meta_device_request, _set_use_cuda, _wrap_constructors
 
 from ..numerical import log_softmax as _numerical_log_softmax, masked_select as _numerical_masked_select, softmax as _numerical_softmax
 
-from ...types import _DEVICE_CTX_STACK, _device_is_cpu, _device_is_cuda, _dtype_to_str, _make_cpu_resident, _make_cuda_resident, _mark_cpu_like, _var_has_cpu_residency_hint, _var_is_cpu_resident, current_accelerator_index, device, dtype, _cuda_index_of, _is_index, _move_to_cuda_index
+from ...types import _DEVICE_CTX_STACK, _device_is_cpu, _device_is_cuda, _dtype_to_str, _make_cpu_resident, _make_cuda_resident, _mark_cpu_like, _var_has_cpu_residency_hint, _var_is_cpu_resident, current_accelerator_index, device, dtype, in_meta_device_context, _cuda_index_of, _is_index, _move_to_cuda_index
 
 from ...fidelity import Fidelity, register_fidelity
 
@@ -571,7 +571,8 @@ def _detached_values(data, Var, dtypes):
 def tensor(data, dtype=None, device=None, requires_grad=False, **kw):
     g = compatibility_owner(jt)
     Var = g.Var
-    with tensor_frontend(Var, device=device, like=data):
+    meta = _is_meta_device_request(device) or (device is None and in_meta_device_context())
+    with tensor_frontend(Var, device="cpu" if meta else device, like=data):
         if type(data) in (list, tuple) and not data and not kw:
             # There are no host bytes to convert or migrate. Construct fresh
             # storage metadata directly in the requested frontend/device scope.
@@ -585,6 +586,8 @@ def tensor(data, dtype=None, device=None, requires_grad=False, **kw):
             v.requires_grad_(bool(requires_grad))
             if requires_grad:
                 _torch_register_leaf(v)
+            if meta:
+                v._jittor_torch_meta = True
             return v
         import numpy as _np
         ds = _dtype_to_str(dtype)
@@ -645,17 +648,24 @@ def tensor(data, dtype=None, device=None, requires_grad=False, **kw):
         if requires_grad:
             v.requires_grad_(True)
             _torch_register_leaf(v)
+        if meta:
+            v._jittor_torch_meta = True
         return v
 
 
 def as_tensor(data, dtype=None, device=None):
     g = compatibility_owner(jt)
     Var = g.Var
-    with tensor_frontend(Var, device=device, like=data):
+    meta = _is_meta_device_request(device)
+    with tensor_frontend(Var, device="cpu" if meta else device, like=data):
         if isinstance(data, jt.Var):
             r = data if isinstance(data, Var) else g.Tensor(data)
             if dtype is not None and _jittor_dtype_name(r.dtype) != _dtype_to_str(dtype):
                 r = r.cast(_dtype_to_str(dtype))
+            if meta:
+                r = jt.Var.copy(r).detach()
+                r._jittor_torch_meta = True
+                return r
             if _device_is_cpu(device):
                 return _make_cpu_resident(r)
             if _device_is_cuda(device):
