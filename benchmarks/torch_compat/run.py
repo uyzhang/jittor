@@ -76,6 +76,22 @@ def list_workloads():
     return rows
 
 
+def _ensure_checkout_shim(state):
+    """Deploy this checkout's torch shim into ``state/shim`` so any venv works."""
+    shim_dir = state / "shim"
+    if (shim_dir / "torch" / "__init__.py").is_file():
+        return shim_dir
+    import importlib.util
+    deploy_path = REPO / "compat" / "shim" / "deploy.py"
+    if not deploy_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_bench_shim_deploy", deploy_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.deploy(shim_dir, resource_root=REPO / "compat" / "shim" / "resources")
+    return shim_dir
+
+
 def environment_for(runtime, options, state):
     env = os.environ.copy()
     if runtime == "torch":
@@ -83,8 +99,12 @@ def environment_for(runtime, options, state):
         for name in JITTOR_VARIABLES + ("JT_BUILD_NVCC_PATH", "nvcc_path"):
             env.pop(name, None)
     else:
-        # Pin this checkout, and a cache that no test run shares.
-        env["PYTHONPATH"] = str(REPO / "python")
+        # Pin this checkout and its torch shim, plus a cache no test run shares.
+        shim_dir = _ensure_checkout_shim(state)
+        py_entries = [str(REPO / "python")]
+        if shim_dir is not None:
+            py_entries.insert(0, str(shim_dir))
+        env["PYTHONPATH"] = os.pathsep.join(py_entries)
         env["JITTOR_HOME"] = str(state / "jittor-home")
         env["JITTOR_TORCH_CACHE_ROOT"] = str(state / "torch-shim")
         env["cache_name"] = "bench-torch-compat"
@@ -216,7 +236,9 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workloads", default="all",
-                        help="comma-separated names, a family, or 'all'")
+                        help="comma-separated names, a family prefix, or 'all'")
+    parser.add_argument("--family", default=None,
+                        help="comma-separated families (e.g. ops,runtime,qwen3,moe,lora)")
     parser.add_argument("--runtimes", default="torch,jittor")
     parser.add_argument("--torch-python",
                         default=os.environ.get("REAL_TORCH_PYTHON"))
@@ -272,6 +294,14 @@ def main():
             parser.error("--%s must be positive" % name)
 
     names = [row["name"] for row in catalogue]
+    if options.family:
+        wanted = {f.strip() for f in options.family.split(",") if f.strip()}
+        known_families = {row.get("family", "") for row in catalogue}
+        unknown = wanted - known_families
+        if unknown:
+            parser.error("unknown family %r; available: %s"
+                         % (sorted(unknown), ", ".join(sorted(known_families))))
+        names = [row["name"] for row in catalogue if row.get("family") in wanted]
     if options.workloads == "all":
         selected = names
     else:

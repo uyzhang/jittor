@@ -32,11 +32,27 @@ SUITES = (
     },
     {
         "id": "torch-compat",
-        "purpose": "Compare identical real-model workloads in independent Jittor Torch and PyTorch processes.",
+        "purpose": "Compare identical PyTorch operator, runtime/CUDA-Graph, and real-model workloads in independent Jittor Torch and PyTorch processes.",
         "entrypoints": ["benchmarks/torch_compat/run.py"],
         "references": ["benchmarks/torch_compat/README.md", "benchmarks/torch_compat/workloads.py"],
-        "role": "Manual, with per-run results and reports.",
+        "role": "Primary Torch-compat benchmark suite (manual, with per-run results and reports).",
         "runtimes": ["jittor Torch frontend", "binary PyTorch (+ torch_npu for NPU)"],
+    },
+    {
+        "id": "opinfo-sweep",
+        "purpose": "Sweep all 230 Torch-facing OpInfo operators (Jittor Torch compat vs PyTorch) and rank slowest/fastest ops by domain.",
+        "entrypoints": ["benchmarks/torch_compat/bench_opinfo.py"],
+        "references": ["benchmarks/torch_compat/README.md"],
+        "role": "Full-operator diagnostic leaderboard (manual, zero Jittor import on PyTorch side).",
+        "runtimes": ["jittor Torch frontend", "binary PyTorch"],
+    },
+    {
+        "id": "distributed",
+        "purpose": "Compare torch.distributed collective bandwidth (NCCL/Gloo/HCCL) and multi-rank DDP training scaling.",
+        "entrypoints": ["benchmarks/distributed/bench_collectives.py"],
+        "references": ["benchmarks/distributed/README.md"],
+        "role": "Manual multi-rank benchmark runnable identically via jtrun or torchrun.",
+        "runtimes": ["jittor Torch frontend", "binary PyTorch"],
     },
     {
         "id": "acl",
@@ -163,7 +179,7 @@ def catalog(root=REPO, selected=None):
                 device for row in suite["workloads"]
                 for device in row["parameters"].get("device", [])
             })
-        elif suite["id"] == "torch-compat":
+        elif suite["id"] in ("torch-compat", "opinfo-sweep", "distributed"):
             entry = root / suite["entrypoints"][0]
             # Reuse the suite's own host-only inventory, in a process that
             # excludes site packages. No framework/JIT/model initialization.

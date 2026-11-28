@@ -326,6 +326,26 @@ class Qwen3Train(_Qwen3):
         return {"batch": self.batch, "seq": self.length, "optimizer": "AdamW"}
 
 
+class Qwen3TrainBF16(Qwen3Train):
+    name = "qwen3_train_bf16"
+    default_dtype = "bfloat16"
+    description = "Qwen3-0.6B bfloat16 causal-LM training step: forward, backward, AdamW"
+
+
+class Qwen3PrefillLong(Qwen3Prefill):
+    name = "qwen3_prefill_long"
+    description = "Qwen3-0.6B long-context 4096-token prefill (bfloat16)"
+
+    def setup(self):
+        self.model, config = self._model()
+        self.model.eval()
+        self.batch = self._batch(1, 1)
+        self.length = 64 if self.tiny else 4096
+        self.pool = [(self.integers(config.vocab_size, (self.batch, self.length)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.length
+
+
 # --------------------------------------------------------------------------
 # Stable Diffusion 1.5 (latent diffusion)
 # --------------------------------------------------------------------------
@@ -800,11 +820,1079 @@ class BertBaseInfer(_Bert):
                                attention_mask=attention_mask).logits]
 
 
+# --------------------------------------------------------------------------
+# Torch-compat core operators (pure PyTorch, zero external package deps)
+# --------------------------------------------------------------------------
+
+class OpMatmulBF16(Workload):
+    name = "op_matmul_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "samples"
+    default_dtype = "bfloat16"
+    description = "Batched GEMM torch.matmul, [16, 1024, 1024] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(4, 16)
+        self.dim = 64 if self.tiny else 1024
+        self.pool = [(self.normal((self.batch, self.dim, self.dim)),
+                      self.normal((self.batch, self.dim, self.dim)))
+                     for _ in range(self.pool_size)]
+        self.items = self.batch
+
+    def run(self, a, b):
+        with self.torch.no_grad():
+            return [self.torch.matmul(a, b)]
+
+    def config(self):
+        return {"batch": self.batch, "m": self.dim, "n": self.dim, "k": self.dim}
+
+
+class OpConv2dFP16(Workload):
+    name = "op_conv2d_fp16"
+    family = "ops"
+    mode = "train"
+    unit = "images"
+    default_dtype = "float16"
+    description = "Conv2d 3x3 forward+backward, [64, 256, 56, 56] -> 256 fp16"
+    iterations = (5, 20)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.batch = self._batch(4, 64)
+        self.channels = 16 if self.tiny else 256
+        self.spatial = 16 if self.tiny else 56
+        self.model = self.init(
+            nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1, bias=False)
+        ).to(device=self.device, dtype=self.dtype).train()
+        self.pool = [(self.normal((self.batch, self.channels, self.spatial, self.spatial)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch
+
+    def run(self, x):
+        y = self.model(x)
+        loss = y.float().pow(2).mean()
+        loss.backward()
+        self.model.zero_grad(set_to_none=True)
+        return [loss]
+
+    def config(self):
+        return {"batch": self.batch, "channels": self.channels, "hw": self.spatial}
+
+
+class OpRMSNormBF16(Workload):
+    name = "op_rmsnorm_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "Residual add + F.rms_norm, [4, 2048, 2048] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 4)
+        self.seq = 64 if self.tiny else 2048
+        self.dim = 128 if self.tiny else 2048
+        self.weight = self.torch.ones((self.dim,), device=self.device, dtype=self.dtype)
+        self.pool = [(self.normal((self.batch, self.seq, self.dim)),
+                      self.normal((self.batch, self.seq, self.dim)))
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x, residual):
+        F = self.torch.nn.functional
+        with self.torch.no_grad():
+            h = x + residual
+            return [F.rms_norm(h, (self.dim,), self.weight, eps=1e-6)]
+
+    def config(self):
+        return {"batch": self.batch, "seq": self.seq, "hidden": self.dim}
+
+
+class OpLayerNormFP32(Workload):
+    name = "op_layernorm_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "tokens"
+    default_dtype = "float32"
+    description = "F.layer_norm, [16, 512, 1024] fp32"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 16)
+        self.seq = 32 if self.tiny else 512
+        self.dim = 128 if self.tiny else 1024
+        self.weight = self.torch.ones((self.dim,), device=self.device, dtype=self.dtype)
+        self.bias = self.torch.zeros((self.dim,), device=self.device, dtype=self.dtype)
+        self.pool = [(self.normal((self.batch, self.seq, self.dim)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        F = self.torch.nn.functional
+        with self.torch.no_grad():
+            return [F.layer_norm(x, (self.dim,), self.weight, self.bias, eps=1e-5)]
+
+    def config(self):
+        return {"batch": self.batch, "seq": self.seq, "hidden": self.dim}
+
+
+class OpSoftmaxBF16(Workload):
+    name = "op_softmax_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "rows"
+    default_dtype = "bfloat16"
+    description = "Large-axis F.softmax(dim=-1), [16, 512, 4096] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 16)
+        self.rows = 32 if self.tiny else 512
+        self.cols = 256 if self.tiny else 4096
+        self.pool = [(self.normal((self.batch, self.rows, self.cols)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.rows
+
+    def run(self, x):
+        with self.torch.no_grad():
+            return [self.torch.nn.functional.softmax(x, dim=-1)]
+
+    def config(self):
+        return {"batch": self.batch, "rows": self.rows, "cols": self.cols}
+
+
+class OpSDPACausalBF16(Workload):
+    name = "op_sdpa_causal_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "Causal F.scaled_dot_product_attention, [4, 16, 1024, 128] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 4)
+        self.heads = 4 if self.tiny else 16
+        self.seq = 64 if self.tiny else 1024
+        self.head_dim = 32 if self.tiny else 128
+        shape = (self.batch, self.heads, self.seq, self.head_dim)
+        self.pool = [(self.normal(shape), self.normal(shape), self.normal(shape))
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, q, k, v):
+        F = self.torch.nn.functional
+        with self.torch.no_grad():
+            return [F.scaled_dot_product_attention(q, k, v, is_causal=True)]
+
+    def config(self):
+        return {"batch": self.batch, "heads": self.heads,
+                "seq": self.seq, "head_dim": self.head_dim}
+
+
+class OpSwiGLUMlpBF16(Workload):
+    name = "op_swiglu_mlp_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "SwiGLU FFN down(silu(gate(x)) * up(x)), [4, 1024, 2048->5504] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.batch = self._batch(2, 4)
+        self.seq = 32 if self.tiny else 1024
+        self.hidden = 128 if self.tiny else 2048
+        self.inter = 256 if self.tiny else 5504
+
+        class _SwiGLU(nn.Module):
+            def __init__(m, hidden, inter):
+                super().__init__()
+                m.gate = nn.Linear(hidden, inter, bias=False)
+                m.up = nn.Linear(hidden, inter, bias=False)
+                m.down = nn.Linear(inter, hidden, bias=False)
+
+            def forward(m, x):
+                return m.down(nn.functional.silu(m.gate(x)) * m.up(x))
+
+        self.model = self.init(_SwiGLU(self.hidden, self.inter)).to(
+            device=self.device, dtype=self.dtype).eval()
+        self.pool = [(self.normal((self.batch, self.seq, self.hidden)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        with self.torch.no_grad():
+            return [self.model(x)]
+
+    def config(self):
+        return {"batch": self.batch, "seq": self.seq,
+                "hidden": self.hidden, "intermediate": self.inter}
+
+
+class OpRoPEBF16(Workload):
+    name = "op_rope_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "Rotary position embedding (cos/sin rotation), [4, 16, 2048, 128] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 4)
+        self.heads = 4 if self.tiny else 16
+        self.seq = 64 if self.tiny else 2048
+        self.head_dim = 32 if self.tiny else 128
+        half = self.head_dim // 2
+        inv_freq = 1.0 / (10000.0 ** (np.arange(0, half, dtype=np.float32) / half))
+        pos = np.arange(self.seq, dtype=np.float32)[:, None] * inv_freq[None, :]
+        emb = np.concatenate([pos, pos], axis=-1)[None, None, :, :]
+        self.cos = self.torch.tensor(np.cos(emb), device=self.device).to(self.dtype)
+        self.sin = self.torch.tensor(np.sin(emb), device=self.device).to(self.dtype)
+        shape = (self.batch, self.heads, self.seq, self.head_dim)
+        self.pool = [(self.normal(shape), self.normal(shape))
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, q, k):
+        torch = self.torch
+        half = self.head_dim // 2
+        with torch.no_grad():
+            q_rot = torch.cat((-q[..., half:], q[..., :half]), dim=-1)
+            k_rot = torch.cat((-k[..., half:], k[..., :half]), dim=-1)
+            return [q * self.cos + q_rot * self.sin,
+                    k * self.cos + k_rot * self.sin]
+
+    def config(self):
+        return {"batch": self.batch, "heads": self.heads,
+                "seq": self.seq, "head_dim": self.head_dim}
+
+
+class OpCrossEntropyVocab(Workload):
+    name = "op_cross_entropy_vocab"
+    family = "ops"
+    mode = "train"
+    unit = "tokens"
+    default_dtype = "float32"
+    description = "Large-vocab F.cross_entropy forward+backward, [2048, 32000] fp32"
+    iterations = (5, 20)
+
+    def setup(self):
+        self.tokens = 64 if self.tiny else 2048
+        self.vocab = 1024 if self.tiny else 32000
+        self.pool = []
+        for _ in range(self.pool_size):
+            logits = self.normal((self.tokens, self.vocab))
+            targets = self.integers(self.vocab, (self.tokens,))
+            self.pool.append((logits, targets))
+        self.items = self.tokens
+
+    def run(self, logits, targets):
+        x = logits.detach().clone().requires_grad_(True)
+        loss = self.torch.nn.functional.cross_entropy(x, targets)
+        loss.backward()
+        return [loss, x.grad]
+
+    def config(self):
+        return {"tokens": self.tokens, "vocab": self.vocab}
+
+
+class OpAdamWStep(Workload):
+    name = "op_adamw_step"
+    family = "ops"
+    mode = "train"
+    unit = "tensors"
+    default_dtype = "float32"
+    description = "AdamW optimizer step over 256 parameter tensors [512, 512]"
+    iterations = (5, 25)
+    compile_what = None
+
+    def setup(self):
+        nn = self.torch.nn
+        self.num_tensors = 16 if self.tiny else 256
+        self.dim = 32 if self.tiny else 512
+        self.model = self.init(
+            nn.ModuleList([nn.Linear(self.dim, self.dim, bias=False)
+                           for _ in range(self.num_tensors)])
+        ).to(device=self.device, dtype=self.dtype)
+        self.optimizer = self.torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        # Pre-populate deterministic gradient pools (cycled per step).
+        self.pool = [
+            tuple(self.normal((self.dim, self.dim)) for _ in range(self.num_tensors))
+            for _ in range(2)
+        ]
+        self.items = self.num_tensors
+
+    def run(self, *grads):
+        for p, g in zip(self.model.parameters(), grads):
+            p.grad = g
+        self.optimizer.step()
+        return [next(self.model.parameters())]
+
+    def config(self):
+        return {"tensors": self.num_tensors, "shape": [self.dim, self.dim]}
+
+
+class OpLinearBF16(Workload):
+    name = "op_linear_bf16"
+    family = "ops"
+    mode = "train"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "nn.Linear projection forward+backward, [4, 1024, 2048->2048] bf16"
+    iterations = (5, 25)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.batch = self._batch(2, 4)
+        self.seq = 32 if self.tiny else 1024
+        self.dim = 128 if self.tiny else 2048
+        self.model = self.init(
+            nn.Linear(self.dim, self.dim, bias=False)
+        ).to(device=self.device, dtype=self.dtype).train()
+        self.pool = [(self.normal((self.batch, self.seq, self.dim)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        loss = self.model(x).float().pow(2).mean()
+        loss.backward()
+        self.model.zero_grad(set_to_none=True)
+        return [loss]
+
+    def config(self):
+        return {"batch": self.batch, "seq": self.seq, "dim": self.dim}
+
+
+class OpConvTranspose2dFP16(Workload):
+    name = "op_conv_transpose2d_fp16"
+    family = "ops"
+    mode = "infer"
+    unit = "images"
+    default_dtype = "float16"
+    description = "ConvTranspose2d 4x4 stride 2 upsampling, [16, 128, 64, 64] fp16"
+    iterations = (5, 25)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.batch = self._batch(2, 16)
+        self.channels = 16 if self.tiny else 128
+        self.spatial = 16 if self.tiny else 64
+        self.model = self.init(
+            nn.ConvTranspose2d(self.channels, self.channels, kernel_size=4,
+                               stride=2, padding=1, bias=False)
+        ).to(device=self.device, dtype=self.dtype).eval()
+        self.pool = [(self.normal((self.batch, self.channels, self.spatial, self.spatial)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch
+
+    def run(self, x):
+        with self.torch.no_grad():
+            return [self.model(x)]
+
+    def config(self):
+        return {"batch": self.batch, "channels": self.channels, "hw": self.spatial}
+
+
+class OpGroupNormFP16(Workload):
+    name = "op_groupnorm_fp16"
+    family = "ops"
+    mode = "infer"
+    unit = "images"
+    default_dtype = "float16"
+    description = "F.group_norm (32 groups), [16, 256, 64, 64] fp16 (UNet/SD hotspot)"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 16)
+        self.channels = 32 if self.tiny else 256
+        self.groups = 8 if self.tiny else 32
+        self.spatial = 16 if self.tiny else 64
+        self.weight = self.torch.ones((self.channels,), device=self.device, dtype=self.dtype)
+        self.bias = self.torch.zeros((self.channels,), device=self.device, dtype=self.dtype)
+        self.pool = [(self.normal((self.batch, self.channels, self.spatial, self.spatial)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch
+
+    def run(self, x):
+        with self.torch.no_grad():
+            return [self.torch.nn.functional.group_norm(
+                x, self.groups, self.weight, self.bias, eps=1e-5)]
+
+    def config(self):
+        return {"batch": self.batch, "channels": self.channels,
+                "groups": self.groups, "hw": self.spatial}
+
+
+class OpGeluBF16(Workload):
+    name = "op_gelu_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "F.gelu(approximate='tanh'), [16, 512, 4096] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 16)
+        self.seq = 32 if self.tiny else 512
+        self.dim = 256 if self.tiny else 4096
+        self.pool = [(self.normal((self.batch, self.seq, self.dim)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        with self.torch.no_grad():
+            return [self.torch.nn.functional.gelu(x, approximate="tanh")]
+
+    def config(self):
+        return {"batch": self.batch, "seq": self.seq, "dim": self.dim}
+
+
+class OpElementwiseChainBF16(Workload):
+    name = "op_elementwise_chain_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "M-elems"
+    default_dtype = "bfloat16"
+    description = "Fused pointwise chain x*sigmoid(x) + y*tanh(z), [16, 1024, 1024] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.shape = (2, 64, 64) if self.tiny else (16, 1024, 1024)
+        self.pool = [(self.normal(self.shape), self.normal(self.shape),
+                      self.normal(self.shape))
+                     for _ in range(self.pool_size)]
+        self.items = float(np.prod(self.shape)) / 1e6
+
+    def run(self, x, y, z):
+        torch = self.torch
+        with torch.no_grad():
+            return [x * torch.sigmoid(x) + y * torch.tanh(z)]
+
+    def config(self):
+        return {"shape": list(self.shape)}
+
+
+class OpReduceSumMeanFP32(Workload):
+    name = "op_reduce_sum_mean_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "M-elems"
+    default_dtype = "float32"
+    description = "Multi-axis reductions sum + mean + argmax, [32, 1024, 1024] fp32"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.shape = (4, 64, 64) if self.tiny else (32, 1024, 1024)
+        self.pool = [(self.normal(self.shape),) for _ in range(self.pool_size)]
+        self.items = float(np.prod(self.shape)) / 1e6
+
+    def run(self, x):
+        with self.torch.no_grad():
+            s = x.sum(dim=-1)
+            m = x.mean(dim=1)
+            idx = x.argmax(dim=-1)
+            return [s + m + idx.to(x.dtype) * 1e-4]
+
+    def config(self):
+        return {"shape": list(self.shape)}
+
+
+class OpSortTopkFP32(Workload):
+    name = "op_sort_topk_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "rows"
+    default_dtype = "float32"
+    description = "torch.topk(k=64) + torch.sort, [64, 8192] fp32 (sampling/routing)"
+    iterations = (5, 25)
+
+    def setup(self):
+        self.rows = 8 if self.tiny else 64
+        self.cols = 256 if self.tiny else 8192
+        self.k = 16 if self.tiny else 64
+        self.pool = [(self.normal((self.rows, self.cols)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.rows
+
+    def run(self, x):
+        torch = self.torch
+        with torch.no_grad():
+            top_v, _ = torch.topk(x, self.k, dim=-1)
+            sorted_v, _ = torch.sort(x, dim=-1)
+            return [top_v.mean() + sorted_v[:, :self.k].mean()]
+
+    def config(self):
+        return {"rows": self.rows, "cols": self.cols, "k": self.k}
+
+
+class OpEmbeddingBF16(Workload):
+    name = "op_embedding_bf16"
+    family = "ops"
+    mode = "train"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "Large-vocab nn.Embedding forward+backward, vocab=128000 dim=1024 bf16"
+    iterations = (5, 25)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.vocab = 2048 if self.tiny else 128000
+        self.dim = 128 if self.tiny else 1024
+        self.batch = self._batch(2, 4)
+        self.seq = 32 if self.tiny else 1024
+        self.model = self.init(
+            nn.Embedding(self.vocab, self.dim)
+        ).to(device=self.device, dtype=self.dtype).train()
+        self.pool = [(self.integers(self.vocab, (self.batch, self.seq)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, ids):
+        loss = self.model(ids).float().pow(2).mean()
+        loss.backward()
+        self.model.zero_grad(set_to_none=True)
+        return [loss]
+
+    def config(self):
+        return {"vocab": self.vocab, "dim": self.dim, "batch": self.batch, "seq": self.seq}
+
+
+class OpGatherScatterFP32(Workload):
+    name = "op_gather_scatter_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "rows"
+    default_dtype = "float32"
+    description = "torch.gather + scatter_add_, [64, 4096] fp32 (MoE/GNN indexing)"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.rows = 8 if self.tiny else 64
+        self.cols = 256 if self.tiny else 4096
+        self.pool = [(self.normal((self.rows, self.cols)),
+                      self.integers(self.cols, (self.rows, self.cols)))
+                     for _ in range(self.pool_size)]
+        self.items = self.rows
+
+    def run(self, x, index):
+        torch = self.torch
+        with torch.no_grad():
+            gathered = torch.gather(x, 1, index)
+            out = torch.zeros_like(x)
+            out.scatter_add_(1, index, gathered)
+            return [out]
+
+    def config(self):
+        return {"rows": self.rows, "cols": self.cols}
+
+
+class OpCatStackFP32(Workload):
+    name = "op_cat_stack_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "M-elems"
+    default_dtype = "float32"
+    description = "torch.cat + torch.stack over 8 tensors [16, 256, 256] fp32"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.count = 4 if self.tiny else 8
+        self.shape = (2, 32, 32) if self.tiny else (16, 256, 256)
+        self.pool = [tuple(self.normal(self.shape) for _ in range(self.count))
+                     for _ in range(self.pool_size)]
+        self.items = float(self.count * np.prod(self.shape)) / 1e6
+
+    def run(self, *tensors):
+        torch = self.torch
+        with torch.no_grad():
+            c = torch.cat(tensors, dim=1)
+            s = torch.stack(tensors, dim=0)
+            return [c.mean() + s.mean()]
+
+    def config(self):
+        return {"count": self.count, "shape": list(self.shape)}
+
+
+class OpTransposeContiguousBF16(Workload):
+    name = "op_transpose_contiguous_bf16"
+    family = "ops"
+    mode = "infer"
+    unit = "M-elems"
+    default_dtype = "bfloat16"
+    description = "4D attention permute(0,2,1,3).contiguous(), [16, 1024, 16, 128] bf16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.shape = (2, 32, 4, 32) if self.tiny else (16, 1024, 16, 128)
+        self.pool = [(self.normal(self.shape),) for _ in range(self.pool_size)]
+        self.items = float(np.prod(self.shape)) / 1e6
+
+    def run(self, x):
+        with self.torch.no_grad():
+            return [x.permute(0, 2, 1, 3).contiguous()]
+
+    def config(self):
+        return {"shape": list(self.shape)}
+
+
+class OpPoolInterpolateFP16(Workload):
+    name = "op_pool_interpolate_fp16"
+    family = "ops"
+    mode = "infer"
+    unit = "images"
+    default_dtype = "float16"
+    description = "F.max_pool2d + F.interpolate(bilinear), [32, 128, 128, 128] fp16"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.batch = self._batch(2, 32)
+        self.channels = 16 if self.tiny else 128
+        self.spatial = 16 if self.tiny else 128
+        self.pool = [(self.normal((self.batch, self.channels, self.spatial, self.spatial)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch
+
+    def run(self, x):
+        F = self.torch.nn.functional
+        with self.torch.no_grad():
+            down = F.max_pool2d(x, kernel_size=2, stride=2)
+            up = F.interpolate(down, scale_factor=2.0, mode="bilinear", align_corners=False)
+            return [up]
+
+    def config(self):
+        return {"batch": self.batch, "channels": self.channels, "hw": self.spatial}
+
+
+class OpFftRfftFP32(Workload):
+    name = "op_fft_rfft_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "M-elems"
+    default_dtype = "float32"
+    description = "torch.fft.rfft + irfft round-trip, [64, 256, 256] fp32"
+    iterations = (5, 25)
+
+    def setup(self):
+        self.shape = (4, 32, 32) if self.tiny else (64, 256, 256)
+        self.pool = [(self.normal(self.shape),) for _ in range(self.pool_size)]
+        self.items = float(np.prod(self.shape)) / 1e6
+
+    def run(self, x):
+        fft = self.torch.fft
+        with self.torch.no_grad():
+            spec = fft.rfft(x, dim=-1)
+            back = fft.irfft(spec, n=self.shape[-1], dim=-1)
+            return [back]
+
+    def config(self):
+        return {"shape": list(self.shape)}
+
+
+class OpLinalgSolveSvdFP32(Workload):
+    name = "op_linalg_solve_svd_fp32"
+    family = "ops"
+    mode = "infer"
+    unit = "matrices"
+    default_dtype = "float32"
+    description = "Batched torch.linalg.solve + svd, [16, 128, 128] fp32"
+    iterations = (5, 20)
+    compile_what = None
+
+    def setup(self):
+        self.batch = self._batch(2, 16)
+        self.dim = 16 if self.tiny else 128
+        eye = self.torch.eye(self.dim, device=self.device, dtype=self.dtype) * float(self.dim)
+        self.pool = [
+            (self.normal((self.batch, self.dim, self.dim)) + eye,
+             self.normal((self.batch, self.dim, 16 if self.tiny else 64)))
+            for _ in range(self.pool_size)
+        ]
+        self.items = self.batch
+
+    def run(self, a, b):
+        la = self.torch.linalg
+        with self.torch.no_grad():
+            sol = la.solve(a, b)
+            _u, s, _vh = la.svd(a, full_matrices=False)
+            return [sol.mean() + s.mean()]
+
+    def config(self):
+        return {"batch": self.batch, "dim": self.dim}
+
+
+class OpClipGradNormFP32(Workload):
+    name = "op_clip_grad_norm_fp32"
+    family = "ops"
+    mode = "train"
+    unit = "tensors"
+    default_dtype = "float32"
+    description = "torch.nn.utils.clip_grad_norm_ over 128 gradients [256, 256] fp32"
+    iterations = (5, 25)
+    compile_what = None
+
+    def setup(self):
+        nn = self.torch.nn
+        self.num_tensors = 16 if self.tiny else 128
+        self.dim = 32 if self.tiny else 256
+        self.model = self.init(
+            nn.ModuleList([nn.Linear(self.dim, self.dim, bias=False)
+                           for _ in range(self.num_tensors)])
+        ).to(device=self.device, dtype=self.dtype)
+        self.pool = [
+            tuple(self.normal((self.dim, self.dim)) for _ in range(self.num_tensors))
+            for _ in range(2)
+        ]
+        self.items = self.num_tensors
+
+    def run(self, *grads):
+        for p, g in zip(self.model.parameters(), grads):
+            p.grad = g.clone()
+        total_norm = self.torch.nn.utils.clip_grad_norm_(
+            list(self.model.parameters()), max_norm=1.0
+        )
+        return [total_norm if isinstance(total_norm, self.torch.Tensor)
+                else self.torch.tensor(float(total_norm), device=self.device)]
+
+    def config(self):
+        return {"tensors": self.num_tensors, "shape": [self.dim, self.dim]}
+
+
+# --------------------------------------------------------------------------
+# Runtime overhead, CUDA Graph / compile, allocator, and transfer
+# --------------------------------------------------------------------------
+
+def _decoder_block(torch, hidden, heads, inter):
+    nn = torch.nn
+    F = nn.functional
+
+    class _DecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.heads = heads
+            self.head_dim = hidden // heads
+            self.norm1 = nn.RMSNorm(hidden, eps=1e-6)
+            self.qkv = nn.Linear(hidden, 3 * hidden, bias=False)
+            self.o_proj = nn.Linear(hidden, hidden, bias=False)
+            self.norm2 = nn.RMSNorm(hidden, eps=1e-6)
+            self.gate = nn.Linear(hidden, inter, bias=False)
+            self.up = nn.Linear(hidden, inter, bias=False)
+            self.down = nn.Linear(inter, hidden, bias=False)
+
+        def forward(self, x):
+            b, s, d = x.shape
+            h = self.norm1(x)
+            qkv = self.qkv(h).reshape(b, s, 3, self.heads, self.head_dim)
+            q = qkv[:, :, 0].transpose(1, 2)
+            k = qkv[:, :, 1].transpose(1, 2)
+            v = qkv[:, :, 2].transpose(1, 2)
+            attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attn = attn.transpose(1, 2).reshape(b, s, d)
+            x = x + self.o_proj(attn)
+            h2 = self.norm2(x)
+            return x + self.down(F.silu(self.gate(h2)) * self.up(h2))
+
+    return _DecoderLayer()
+
+
+class RtDispatchMicroOps(Workload):
+    name = "rt_dispatch_micro_ops"
+    family = "runtime"
+    mode = "infer"
+    unit = "ops"
+    default_dtype = "float32"
+    description = "200 chained small tensor ops [64, 64] isolating per-op host dispatch"
+    iterations = (5, 30)
+
+    def setup(self):
+        self.steps = 20 if self.tiny else 200
+        self.dim = 16 if self.tiny else 64
+        self.pool = [(self.normal((self.dim, self.dim)),
+                      self.normal((self.dim, self.dim)))
+                     for _ in range(self.pool_size)]
+        self.items = self.steps
+
+    def run(self, x, y):
+        with self.torch.no_grad():
+            acc = x
+            for _ in range(self.steps // 2):
+                acc = acc * 0.99 + y * 0.01
+                acc = self.torch.nn.functional.relu(acc)
+            return [acc]
+
+    def config(self):
+        return {"ops": self.steps, "shape": [self.dim, self.dim]}
+
+
+class RtTransformerLayerTrain(Workload):
+    name = "rt_transformer_layer_train"
+    family = "runtime"
+    mode = "train"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = ("4-layer Decoder Transformer training (RMSNorm+SDPA+SwiGLU+AdamW), "
+                   "shape-stable for eager vs --compile reduce-overhead / CUDA Graph")
+    iterations = (5, 20)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.layers = 2 if self.tiny else 4
+        self.batch = self._batch(2, 4)
+        self.seq = 32 if self.tiny else 512
+        self.hidden = 128 if self.tiny else 1024
+        self.heads = 4 if self.tiny else 16
+        self.inter = 256 if self.tiny else 2816
+        self.model = self.init(nn.Sequential(
+            *[_decoder_block(self.torch, self.hidden, self.heads, self.inter)
+              for _ in range(self.layers)]
+        )).to(device=self.device, dtype=self.dtype).train()
+        self.optimizer = self.torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        self.pool = [(self.normal((self.batch, self.seq, self.hidden)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        out = self.model(x)
+        loss = out.float().pow(2).mean()
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return [loss]
+
+    def config(self):
+        return {"layers": self.layers, "batch": self.batch,
+                "seq": self.seq, "hidden": self.hidden}
+
+
+class RtAllocChurn(Workload):
+    name = "rt_alloc_churn"
+    family = "runtime"
+    mode = "infer"
+    unit = "allocs"
+    default_dtype = "float32"
+    description = "Multi-size varying allocation/compute/release cycle for allocator throughput"
+    iterations = (5, 25)
+    compile_what = None
+
+    def setup(self):
+        self.sizes = (
+            (1024, 4096, 16384, 65536) if self.tiny
+            else (32768, 131072, 524288, 2097152, 8388608)
+        )
+        self.cycles = 4 if self.tiny else 8
+        self.pool = [(self.normal((max(self.sizes),)),) for _ in range(self.pool_size)]
+        self.items = len(self.sizes) * self.cycles
+
+    def run(self, src):
+        torch = self.torch
+        with torch.no_grad():
+            acc = torch.zeros((1,), device=self.device, dtype=self.dtype)
+            for _ in range(self.cycles):
+                live = []
+                for n in self.sizes:
+                    buf = torch.empty((n,), device=self.device, dtype=self.dtype)
+                    buf.copy_(src[:n])
+                    live.append(buf * 1.001 + 0.5)
+                acc = acc + live[-1].mean()
+                del live
+            return [acc]
+
+    def config(self):
+        return {"sizes": list(self.sizes), "cycles": self.cycles}
+
+
+class RtH2DD2HTransfer(Workload):
+    name = "rt_h2d_d2h_transfer"
+    family = "runtime"
+    mode = "infer"
+    unit = "MB"
+    default_dtype = "float32"
+    description = "Multi-size H2D + D2H round-trip sweep (64 KB, 4 MB, 32 MB)"
+    iterations = (5, 25)
+    compile_what = None
+
+    def setup(self):
+        self.elem_counts = (1024, 16384) if self.tiny else (16384, 1048576, 8388608)
+        self.pool = [
+            tuple(self.torch.tensor(
+                self.rng.standard_normal((n,), dtype=np.float32), device="cpu"
+            ) for n in self.elem_counts)
+            for _ in range(2)
+        ]
+        # Round-trip bytes in MB (H2D + D2H = 2x payload).
+        self.items = sum(self.elem_counts) * 4 * 2 / (1024.0 * 1024.0)
+
+    def run(self, *host_tensors):
+        with self.torch.no_grad():
+            last_dev = None
+            total = 0.0
+            for h in host_tensors:
+                d = h.to(self.device)
+                back = d.to("cpu")
+                total += float(back[0].item())
+                last_dev = d
+            return [last_dev + (total * 0.0)]
+
+    def config(self):
+        return {"bytes": [n * 4 for n in self.elem_counts]}
+
+
+# --------------------------------------------------------------------------
+# Modern sparse MoE & LoRA fine-tuning (pure PyTorch, zero external deps)
+# --------------------------------------------------------------------------
+
+class MoEBlockTrainBF16(Workload):
+    name = "moe_block_train_bf16"
+    family = "moe"
+    mode = "train"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "8-expert Top-2 Sparse MoE router + SwiGLU FFN training step (bf16, AdamW)"
+    iterations = (5, 20)
+
+    def setup(self):
+        nn = self.torch.nn
+        F = nn.functional
+        self.batch = self._batch(2, 4)
+        self.seq = 32 if self.tiny else 512
+        self.hidden = 128 if self.tiny else 1024
+        self.inter = 128 if self.tiny else 1024
+        self.num_experts = 4 if self.tiny else 8
+        self.top_k = 2
+
+        class _SparseMoE(nn.Module):
+            def __init__(m, hidden, inter, num_experts, top_k):
+                super().__init__()
+                m.num_experts = num_experts
+                m.top_k = top_k
+                m.router = nn.Linear(hidden, num_experts, bias=False)
+                m.w_gate = nn.Parameter(
+                    self.torch.empty(num_experts, hidden, inter))
+                m.w_up = nn.Parameter(
+                    self.torch.empty(num_experts, hidden, inter))
+                m.w_down = nn.Parameter(
+                    self.torch.empty(num_experts, inter, hidden))
+
+            def forward(m, x):
+                b, s, d = x.shape
+                flat = x.reshape(-1, d)
+                probs = F.softmax(m.router(flat).float(), dim=-1)
+                weights, indices = self.torch.topk(probs, m.top_k, dim=-1)
+                weights = (weights / weights.sum(dim=-1, keepdim=True)).to(x.dtype)
+                out = self.torch.zeros_like(flat)
+                for e in range(m.num_experts):
+                    mask = (indices == e)
+                    token_w = (weights * mask.to(weights.dtype)).sum(dim=-1)
+                    h = F.silu(flat @ m.w_gate[e]) * (flat @ m.w_up[e])
+                    expert_out = h @ m.w_down[e]
+                    out = out + expert_out * token_w.unsqueeze(-1)
+                return out.reshape(b, s, d)
+
+        self.model = self.init(
+            _SparseMoE(self.hidden, self.inter, self.num_experts, self.top_k)
+        ).to(device=self.device, dtype=self.dtype).train()
+        self.optimizer = self.torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        self.pool = [(self.normal((self.batch, self.seq, self.hidden)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        loss = self.model(x).float().pow(2).mean()
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return [loss]
+
+    def config(self):
+        return {"batch": self.batch, "seq": self.seq, "hidden": self.hidden,
+                "experts": self.num_experts, "top_k": self.top_k}
+
+
+class LoRAFinetuneBF16(Workload):
+    name = "lora_finetune_bf16"
+    family = "lora"
+    mode = "train"
+    unit = "tokens"
+    default_dtype = "bfloat16"
+    description = "Frozen 4-layer Transformer + LoRA (r=16) adapter fine-tuning (bf16, AdamW)"
+    iterations = (5, 20)
+
+    def setup(self):
+        nn = self.torch.nn
+        self.layers = 2 if self.tiny else 4
+        self.batch = self._batch(2, 4)
+        self.seq = 32 if self.tiny else 512
+        self.hidden = 128 if self.tiny else 1024
+        self.heads = 4 if self.tiny else 16
+        self.inter = 256 if self.tiny else 2816
+        self.rank = 4 if self.tiny else 16
+
+        class _LoRALinear(nn.Module):
+            def __init__(m, base, rank):
+                super().__init__()
+                m.base = base
+                for p in m.base.parameters():
+                    p.requires_grad_(False)
+                m.lora_a = nn.Linear(base.in_features, rank, bias=False)
+                m.lora_b = nn.Linear(rank, base.out_features, bias=False)
+                m.scale = 2.0 / float(rank)
+
+            def forward(m, x):
+                return m.base(x) + m.lora_b(m.lora_a(x)) * m.scale
+
+        blocks = []
+        for _ in range(self.layers):
+            layer = _decoder_block(self.torch, self.hidden, self.heads, self.inter)
+            layer.qkv = _LoRALinear(layer.qkv, self.rank)
+            layer.o_proj = _LoRALinear(layer.o_proj, self.rank)
+            for name, p in layer.named_parameters():
+                if "lora_" not in name:
+                    p.requires_grad_(False)
+            blocks.append(layer)
+        self.model = self.init(nn.Sequential(*blocks)).to(
+            device=self.device, dtype=self.dtype).train()
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = self.torch.optim.AdamW(trainable, lr=2e-4)
+        self.pool = [(self.normal((self.batch, self.seq, self.hidden)),)
+                     for _ in range(self.pool_size)]
+        self.items = self.batch * self.seq
+
+    def run(self, x):
+        loss = self.model(x).float().pow(2).mean()
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return [loss]
+
+    def config(self):
+        return {"layers": self.layers, "batch": self.batch, "seq": self.seq,
+                "hidden": self.hidden, "lora_rank": self.rank}
+
+
 WORKLOADS = {cls.name: cls for cls in (
-    Qwen3Prefill, Qwen3Decode, Qwen3DecodeStatic, Qwen3Train,
+    # Real models (Transformers / Diffusers / Vision)
+    Qwen3Prefill, Qwen3PrefillLong, Qwen3Decode, Qwen3DecodeStatic,
+    Qwen3Train, Qwen3TrainBF16,
+    MoEBlockTrainBF16, LoRAFinetuneBF16,
     SD15Sample, SD15VAEDecode, SD15Train, DDPMTrain,
     ResNet50Infer, ResNet50InferB1, ResNet50Train, ViTB16Train,
     BertBaseTrain, BertBaseInfer,
+    # Torch-compat operators (25 high-frequency primitives)
+    OpMatmulBF16, OpLinearBF16, OpConv2dFP16, OpConvTranspose2dFP16,
+    OpRMSNormBF16, OpLayerNormFP32, OpGroupNormFP16,
+    OpSoftmaxBF16, OpGeluBF16, OpSwiGLUMlpBF16, OpRoPEBF16,
+    OpSDPACausalBF16, OpElementwiseChainBF16,
+    OpReduceSumMeanFP32, OpSortTopkFP32, OpEmbeddingBF16,
+    OpGatherScatterFP32, OpCatStackFP32, OpTransposeContiguousBF16,
+    OpPoolInterpolateFP16, OpFftRfftFP32, OpLinalgSolveSvdFP32,
+    OpCrossEntropyVocab, OpAdamWStep, OpClipGradNormFP32,
+    # Runtime overhead, CUDA Graph / compile, allocator & transfer
+    RtDispatchMicroOps, RtTransformerLayerTrain, RtAllocChurn, RtH2DD2HTransfer,
 )}
 
 
