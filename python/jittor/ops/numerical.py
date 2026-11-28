@@ -138,7 +138,6 @@ def deg2rad(x):
 
 def arctan2(y,x):
     import jittor as jt
-    angle = jt.zeros(x.shape,dtype=x.dtype)
     x = (x!=0.0).ternary(x, 1e-30)
     angle = (y/x).arctan()
     mask = (x<0)&(y<0)

@@ -14,49 +14,51 @@ from jittor._runtime.dispatch import register_kernel
 # a double overload of `::lgamma`; there was nothing to approximate.
 LGAMMA_CUDA_HEADER = '''
         template <typename T>
-        __global__ void lgamma_cuda(T* __restrict__ x,
-                                T* out,
-                                int batch_shape)
+        __device__ static inline T _jt_lgamma_scalar(T v) { return ::lgamma(v); }
+        template <>
+        __device__ inline float _jt_lgamma_scalar<float>(float v) { return ::lgammaf(v); }
+
+        template <typename T>
+        __global__ void lgamma_cuda(const T* __restrict__ x,
+                                    T* __restrict__ out,
+                                    int64_t elements)
         {
-            int tidx = threadIdx.x;
-            int start = batch_shape / blockDim.x * tidx;
-            int end = threadIdx.x == blockDim.x - 1 ? batch_shape : start + batch_shape / blockDim.x;
-            T* bx = x+batch_shape*blockIdx.x;
-            T* bout = out + batch_shape * blockIdx.x;
-            for(int i=start;i<end;i++) bout[i] = ::lgamma(bx[i]);
+            for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+                 i < elements;
+                 i += (int64_t)gridDim.x * blockDim.x) {
+                out[i] = _jt_lgamma_scalar<T>(x[i]);
+            }
         }
         '''
 
 
 _GAMMA_CUDA_GRID = '''
-        const auto elements = in0->num;
-        if (elements == 0) return;
-        const auto leading = in0->shape.size() ? in0->shape[0] : 1;
-        const auto blocks = elements == leading ? 1 : leading;
-        const auto batch_shape = elements / blocks;
+        const int64_t elements = (int64_t)in0->num;
+        if (elements <= 0) return;
+        constexpr int threads = 256;
+        const int64_t raw_blocks = (elements + threads - 1) / threads;
+        const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
         '''
 
 
 LGAMMA_CUDA_SRC = _GAMMA_CUDA_GRID + '''
-        lgamma_cuda<<<blocks, 16>>>(in0_p, out0_p, batch_shape);
+        lgamma_cuda<<<blocks, threads>>>(in0_p, out0_p, elements);
         '''
 
 
 def polygamma_cuda_header(cpu_header):
     return "#define C10_HOST_DEVICE __host__ __device__\n" + cpu_header + '''
-        __global__ void polygamma_cuda(float* __restrict__ x,
-                        float* out,
+        __global__ void polygamma_cuda(const float* __restrict__ x,
+                        float* __restrict__ out,
                         int n,
-                        int batch_shape)
+                        int64_t elements)
         {
-            int tidx = threadIdx.x;
-            int start = batch_shape / blockDim.x * tidx;
-            int end = threadIdx.x == blockDim.x - 1 ? batch_shape : start + batch_shape / blockDim.x;
-            float* bx = x+batch_shape*blockIdx.x;
-            float* bout = out + batch_shape * blockIdx.x;
-            for(int i=start;i<end;i++)
-                bout[i] = ((n % 2) ? 1.0 : -1.0) * ::exp(::lgamma(static_cast<scalar_t>(n) + 1.0)) *
-                zeta<scalar_t>(static_cast<scalar_t>(n + 1), bx[i]);
+            for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+                 i < elements;
+                 i += (int64_t)gridDim.x * blockDim.x) {
+                out[i] = ((n % 2) ? 1.0 : -1.0) * ::exp(::lgamma(static_cast<scalar_t>(n) + 1.0)) *
+                    zeta<scalar_t>(static_cast<scalar_t>(n + 1), x[i]);
+            }
         }
         '''
 
@@ -73,30 +75,31 @@ DIGAMMA_CUDA_HEADER = '''
         return result;
         }
 
+        __device__ static inline float _jt_trunc(float v) { return ::truncf(v); }
+        __device__ static inline double _jt_trunc(double v) { return ::trunc(v); }
+        __device__ static inline float _jt_modf(float v, float* q) { return ::modff(v, q); }
+        __device__ static inline double _jt_modf(double v, double* q) { return ::modf(v, q); }
+        __device__ static inline float _jt_tan(float v) { return ::tanf(v); }
+        __device__ static inline double _jt_tan(double v) { return ::tan(v); }
+        __device__ static inline float _jt_log(float v) { return ::logf(v); }
+        __device__ static inline double _jt_log(double v) { return ::log(v); }
+
         template <typename T>
         __device__ static inline T calc_digamma(T x) {
         // See [C++ Standard Reference: Gamma Function]
         const T PSI_10 = T(2.25175258906672110764);
         if (x == 0) {
-            // As per C++ standard for gamma related functions and SciPy,
-            // If the argument is ±0, ±∞ is returned
             return std::copysign(std::numeric_limits<T>::infinity(), -x);
         }
 
-        bool x_is_integer = x == ::trunc(x);
+        bool x_is_integer = x == _jt_trunc(x);
         if (x < 0) {
             if (x_is_integer) {
-            // As per C++ standard for gamma related functions and SciPy,
-            // If the argument is a negative integer, NaN is returned
-            return std::numeric_limits<T>::quiet_NaN();
+                return std::numeric_limits<T>::quiet_NaN();
             }
-            // Extracts the fractional part of x as r, since tan(pi * r) is more numerically
-            // accurate than tan(pi * x). While these operations are mathematically equivalent
-            // since both x and r are in radians and tan() has a periodicity of pi, in practice
-            // the computation of pi * x is a source of error (when |x| > 1).
             T q, r;
-            r = ::modf(x, &q);
-            T pi_over_tan_pi_x = T(M_PI) / ::tan(T(M_PI) * r);
+            r = _jt_modf(x, &q);
+            T pi_over_tan_pi_x = T(M_PI) / _jt_tan(T(M_PI) * r);
             return calc_digamma<T>(T(1) - x) - pi_over_tan_pi_x;
         }
 
@@ -126,26 +129,25 @@ DIGAMMA_CUDA_HEADER = '''
             T z = T(1) / (x * x);
             y = z * polevl(z, A, 6);
         }
-        return result + ::log(x) - (T(0.5) / x) - y;
+        return result + _jt_log(x) - (T(0.5) / x) - y;
         }
 
         template <typename T>
-        __global__ void digamma_cuda(T* __restrict__ x,
-                                T* out,
-                                int batch_shape)
+        __global__ void digamma_cuda(const T* __restrict__ x,
+                                     T* __restrict__ out,
+                                     int64_t elements)
         {
-            int tidx = threadIdx.x;
-            int start = batch_shape / blockDim.x * tidx;
-            int end = threadIdx.x == blockDim.x - 1 ? batch_shape : start + batch_shape / blockDim.x;
-            T* bx = x+batch_shape*blockIdx.x;
-            T* bout = out + batch_shape * blockIdx.x;
-            for(int i=start;i<end;i++) bout[i] = calc_digamma<T>(bx[i]);
+            for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+                 i < elements;
+                 i += (int64_t)gridDim.x * blockDim.x) {
+                out[i] = calc_digamma<T>(x[i]);
+            }
         }
         '''
 
 
 DIGAMMA_CUDA_SRC = _GAMMA_CUDA_GRID + '''
-        digamma_cuda<<<blocks, 16>>>(in0_p, out0_p, batch_shape);
+        digamma_cuda<<<blocks, threads>>>(in0_p, out0_p, elements);
         '''
 
 
@@ -164,7 +166,7 @@ def _digamma_cuda(owner, x):
 def _polygamma_cuda(owner, x, n):
     import jittor as jt
     source = _GAMMA_CUDA_GRID + f'''
-        polygamma_cuda<<<blocks, 16>>>(in0_p, out0_p, {n}, batch_shape);
+        polygamma_cuda<<<blocks, threads>>>(in0_p, out0_p, {n}, elements);
     '''
     return jt.code(x.shape, x.dtype, [x], cuda_header=owner.cuda_header, cuda_src=source)
 
