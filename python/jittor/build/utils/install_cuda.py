@@ -31,13 +31,13 @@ def _prepend_env_path(name, path):
     os.environ[name] = os.pathsep.join(paths)
 
 
-def get_cuda_wheel_stack(nvcc_version=None, refresh=False):
+def get_cuda_wheel_stack(nvcc_version=None, refresh=False, nvcc_path=None):
     """Resolve and activate Jittor's supported NVIDIA component-wheel stack."""
 
-    key = str(nvcc_version or "")
+    key = (str(nvcc_version or ""), str(nvcc_path or ""))
     if not refresh and key in _cuda_wheel_stacks:
         return _cuda_wheel_stacks[key]
-    report = cuda_wheel.inspect_cuda_wheel_stack(nvcc_version)
+    report = cuda_wheel.inspect_cuda_wheel_stack(nvcc_version, nvcc_path=nvcc_path)
     stack = report.stack
     if stack is None and report.reason:
         # A failure here is not fatal -- the build falls back to the system
