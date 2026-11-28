@@ -25,15 +25,30 @@
 | 名称 | 家族 | 模式 | 默认 dtype | 内容 |
 | --- | --- | --- | --- | --- |
 | `op_matmul_bf16` | `ops` | 推理 | bf16 | Batched GEMM `torch.matmul`，`[16, 1024, 1024]` |
+| `op_linear_bf16` | `ops` | 训练 | bf16 | `nn.Linear` 投影前向+反向，`[4, 1024, 2048→2048]` |
 | `op_conv2d_fp16` | `ops` | 训练 | fp16 | 3×3 `Conv2d` 前向+反向，`[64, 256, 56, 56]` |
+| `op_conv_transpose2d_fp16` | `ops` | 推理 | fp16 | 4×4 stride 2 `ConvTranspose2d` 上采样，`[16, 128, 64, 64]` |
 | `op_rmsnorm_bf16` | `ops` | 推理 | bf16 | Residual add + `F.rms_norm`，`[4, 2048, 2048]` |
 | `op_layernorm_fp32` | `ops` | 推理 | fp32 | `F.layer_norm`，`[16, 512, 1024]` |
+| `op_groupnorm_fp16` | `ops` | 推理 | fp16 | 32 组 `F.group_norm`，`[16, 256, 64, 64]`（UNet/SD 热点） |
 | `op_softmax_bf16` | `ops` | 推理 | bf16 | 大轴 `F.softmax(dim=-1)`，`[16, 512, 4096]` |
+| `op_gelu_bf16` | `ops` | 推理 | bf16 | `F.gelu(approximate="tanh")`，`[16, 512, 4096]` |
 | `op_sdpa_causal_bf16` | `ops` | 推理 | bf16 | Causal `F.scaled_dot_product_attention`，`[4, 16, 1024, 128]` |
 | `op_swiglu_mlp_bf16` | `ops` | 推理 | bf16 | SwiGLU FFN `down(silu(gate(x)) * up(x))`，`[4, 1024, 2048→5504]` |
 | `op_rope_bf16` | `ops` | 推理 | bf16 | Rotary Position Embedding，`[4, 16, 2048, 128]` |
+| `op_elementwise_chain_bf16` | `ops` | 推理 | bf16 | 逐元素融合链 `x*sigmoid(x)+y*tanh(z)`，`[16, 1024, 1024]` |
+| `op_reduce_sum_mean_fp32` | `ops` | 推理 | fp32 | 多轴归约 `sum`/`mean`/`argmax`，`[32, 1024, 1024]` |
+| `op_sort_topk_fp32` | `ops` | 推理 | fp32 | `torch.topk(k=64)` + `torch.sort`，`[64, 8192]` |
+| `op_embedding_bf16` | `ops` | 训练 | bf16 | 大词表 `nn.Embedding` 前向+反向，`vocab=128000, dim=1024` |
+| `op_gather_scatter_fp32` | `ops` | 推理 | fp32 | `torch.gather` + `scatter_add_`，`[64, 4096]` |
+| `op_cat_stack_fp32` | `ops` | 推理 | fp32 | 8 张量 `torch.cat` + `torch.stack`，`8×[16, 256, 256]` |
+| `op_transpose_contiguous_bf16` | `ops` | 推理 | bf16 | 4D `permute(0,2,1,3).contiguous()`，`[16, 1024, 16, 128]` |
+| `op_pool_interpolate_fp16` | `ops` | 推理 | fp16 | `F.max_pool2d` + `F.interpolate(bilinear)`，`[32, 128, 128, 128]` |
+| `op_fft_rfft_fp32` | `ops` | 推理 | fp32 | `torch.fft.rfft` + `irfft` 往返，`[64, 256, 256]` |
+| `op_linalg_solve_svd_fp32` | `ops` | 推理 | fp32 | 批量 `torch.linalg.solve` + `svd`，`[16, 128, 128]` |
 | `op_cross_entropy_vocab` | `ops` | 训练 | fp32 | 大词表 `F.cross_entropy` 前向+反向，`[2048, 32000]` |
 | `op_adamw_step` | `ops` | 训练 | fp32 | 256 个 `[512, 512]` 张量的一步 `torch.optim.AdamW` |
+| `op_clip_grad_norm_fp32` | `ops` | 训练 | fp32 | 128 个梯度张量的 `clip_grad_norm_`，`[256, 256]` |
 | `rt_dispatch_micro_ops` | `runtime` | 推理 | fp32 | 200 个小算子链式循环，隔离逐算子主机发射/构图开销 |
 | `rt_transformer_layer_train` | `runtime` | 训练 | bf16 | 4 层 Decoder Transformer 训练步，适合 eager vs `--compile reduce-overhead` / CUDA Graph 对比 |
 | `rt_alloc_churn` | `runtime` | 推理 | fp32 | 多尺寸变长分配/计算/释放循环，测量显存分配器吞吐与峰值 |
@@ -63,6 +78,12 @@
 python benchmarks/torch_compat/run.py --family ops --device cuda
 python benchmarks/torch_compat/run.py --family runtime --compile none,reduce-overhead --device cuda
 python benchmarks/torch_compat/run.py --family moe,lora --device cuda
+
+# 全量 230 个 OpInfo 算子对比（覆盖 26 个算子域，按耗时比排序输出）
+python benchmarks/torch_compat/bench_opinfo.py \
+  --torch-python /path/to/torch/bin/python \
+  --jittor-python /path/to/jittor/bin/python \
+  --device cuda --gpu 0 --scale medium
 ```
 
 权重按已发布的模型配置初始化，但数值**由 NumPy 按固定种子生成**（`deterministic_init`：

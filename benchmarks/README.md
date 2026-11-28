@@ -17,7 +17,7 @@ python benchmarks/catalog.py --suite torch-compat --json
 | 套件 | 回答的问题 | 运行方式 |
 | --- | --- | --- |
 | [`asv/`](asv) | 算子、小模型、优化器和传输在不同提交间有没有回归 | `nox -s benchmark` / `nox -s benchmark_cuda`；CI 只选取部分工作负载，其余手工运行 |
-| [`torch_compat/`](torch_compat/README.md) | **主线 Torch 兼容层套件**：同一份纯 PyTorch 代码（10 项核心算子、4 项运行时/CUDA Graph/显存传输、18 项真实与现代模型）经 Jittor Torch 前端与独立 PyTorch 的速度与数值对拍 | `python benchmarks/torch_compat/run.py --family ops\|runtime\|moe\|lora\|qwen3`（支持 CPU、CUDA、NPU） |
+| [`torch_compat/`](torch_compat/README.md) | **主线 Torch 兼容层套件**：同一份纯 PyTorch 代码（25 项高频算子、4 项运行时/CUDA Graph/显存传输、18 项真实与现代模型，以及 230 个 OpInfo 算子全量对比 `bench_opinfo.py`）对拍独立 PyTorch | `run.py --family ops\|runtime\|moe\|lora\|qwen3` / `bench_opinfo.py`（CPU、CUDA、NPU） |
 | [`distributed/`](distributed/README.md) | 纯 `torch.distributed` 集合通信带宽扫频（NCCL/Gloo/HCCL）与多卡 DDP 训练扩展 | `jtrun`（Jittor）或 `torchrun`（PyTorch）运行 `benchmarks/distributed/bench_collectives.py` |
 | [`acl/`](acl/README.md) | 原生 ACL 后端与 `torch_npu` 的速度、数值和 CANN 发射开销 | 在真实昇腾设备上手工运行，含 `xval/` 与 `probes/` |
 | [`ecosystem-speed`](../compat/tests/torch/test_ecosystem_speed.py) | 真实规模的生态前向与反向相对参考运行时多慢 | opt-in pytest 测量，显式设置比值阈值才作为门禁 |
