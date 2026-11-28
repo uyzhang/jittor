@@ -15,6 +15,7 @@ import operator
 import jittor as jt
 from jittor.misc import _pair, _triple
 from jittor._runtime.dispatch import try_dispatch
+from jittor.backends.cuda.kernels.pooling import avg_pool_cuda as _cuda_avg_pool_kernels  # noqa: F401
 
 
 def _pool_output_size(size, kernel, stride, padding, ceil_mode):
@@ -101,6 +102,11 @@ def _avg_pool_nd(x, rank, kernel_size, stride, padding, ceil_mode,
     if rank == 2:
         fast = try_dispatch("nn.pool2d", x, kernel, strides, pads, None, False,
                             ceil_mode, count_include_pad, "mean")
+        if fast is not None:
+            return fast
+    elif rank == 3:
+        fast = try_dispatch("nn.avg_pool3d", x, kernel, strides, pads,
+                            ceil_mode, count_include_pad)
         if fast is not None:
             return fast
     window = ["i{}*{}-{}+i{}".format(2 + a, strides[a], pads[a], 2 + rank + a)
@@ -200,8 +206,14 @@ def adaptive_avg_pool2d(input, output_size):
     end_height = jt.ceil((yy + 1) * height / out_height).int32()
     start_width = jt.floor(xx * width / out_width).int32()
     end_width = jt.ceil((xx + 1) * width / out_width).int32()
-    max_height = int(jt.max(end_height - start_height).data)
-    max_width = int(jt.max(end_width - start_width).data)
+    max_height = max(
+        ((i + 1) * height + out_height - 1) // out_height - (i * height) // out_height
+        for i in range(out_height)
+    )
+    max_width = max(
+        ((i + 1) * width + out_width - 1) // out_width - (i * width) // out_width
+        for i in range(out_width)
+    )
     pixel_count = (end_height - start_height) * (end_width - start_width)
     output = input.reindex(
         [n, channels, out_height, out_width, max_height, max_width],
