@@ -8,6 +8,7 @@
 // file 'LICENSE.txt', which is part of this source code package.
 // ***************************************************************
 #pragma once
+#include <Python.h>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
@@ -79,5 +80,25 @@ uint64 cufft_plan_build_count(int device=-1);
 uint64 cufft_plan_destroy_count(int device=-1);
 // @pyjt(cufft_plan_destroy_failures)
 uint64 cufft_plan_destroy_failures(int device=-1);
+
+void cufft_scale_inplace_f32(float* p, int64_t n, float s, cudaStream_t stream);
+void cufft_scale_inplace_f64(double* p, int64_t n, double s, cudaStream_t stream);
+void cufft_expand_hermitian_f32(
+    const float* half, float* full,
+    int64_t batch, int64_t keep, int64_t L, float scale, int conj_all, cudaStream_t stream);
+void cufft_expand_hermitian_f64(
+    const double* half, double* full,
+    int64_t batch, int64_t keep, int64_t L, double scale, int conj_all, cudaStream_t stream);
+
+// Direct eager 1-D cuFFT entrypoints (R2C, C2R, C2C, real->full-C) for
+// already-materialized contiguous CUDA tensors under no_grad / stop_grad.
+// @pyjt(cufft_eager_rfft_1d)
+PyObject* cufft_eager_rfft_1d(PyObject* x, double scale=1.0);
+// @pyjt(cufft_eager_irfft_1d)
+PyObject* cufft_eager_irfft_1d(PyObject* x, int64 length, double scale=1.0);
+// @pyjt(cufft_eager_c2c_1d)
+PyObject* cufft_eager_c2c_1d(PyObject* x, bool inverse, double scale=1.0);
+// @pyjt(cufft_eager_fft_real_1d)
+PyObject* cufft_eager_fft_real_1d(PyObject* x, bool inverse, double scale=1.0);
 
 } // jittor

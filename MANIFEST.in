@@ -301,6 +301,7 @@ include backends/cuda/libraries/cudnn/src/cudnn_wrapper.cc
 include backends/cuda/libraries/cudnn/src/helper_cudnn.cc
 include backends/cuda/libraries/cufft/include/cufft_utils.h
 include backends/cuda/libraries/cufft/include/cufft_wrapper.h
+include backends/cuda/libraries/cufft/src/cufft_scale.cu
 include backends/cuda/libraries/cufft/src/cufft_wrapper.cc
 include backends/cuda/libraries/cufft/src/helper_cufft.cc
 include backends/cuda/libraries/curand/include/curand_wrapper.h

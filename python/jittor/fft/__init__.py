@@ -13,7 +13,7 @@ from collections import OrderedDict
 import jittor as jt
 from jittor import _arg_policy
 from jittor._core.var import device_scope_like
-from jittor._runtime.backend_libraries import get_library_ops
+from jittor._runtime.backend_libraries import get_library, get_library_ops
 from jittor._runtime.dispatch import dispatch_context
 
 
@@ -22,6 +22,11 @@ _dft_mat_cache = OrderedDict()
 _dft_mat_cache_limit = 16
 _cufft_ops_cache = None
 _cufft_ops_checked = False
+_cufft_eager_rfft = None
+_cufft_eager_irfft = None
+_cufft_eager_c2c = None
+_cufft_eager_fft_real = None
+_cufft_eager_checked = False
 
 
 def _get_cufft_ops():
@@ -30,6 +35,19 @@ def _get_cufft_ops():
         _cufft_ops_checked = True
         _cufft_ops_cache = get_library_ops("cufft", load=True)
     return _cufft_ops_cache
+
+
+def _ensure_cufft_eager():
+    global _cufft_eager_rfft, _cufft_eager_irfft, _cufft_eager_c2c
+    global _cufft_eager_fft_real, _cufft_eager_checked
+    if not _cufft_eager_checked:
+        _cufft_eager_checked = True
+        lib = get_library("cufft", load=True)
+        if lib is not None:
+            _cufft_eager_rfft = getattr(lib, "cufft_eager_rfft_1d", None)
+            _cufft_eager_irfft = getattr(lib, "cufft_eager_irfft_1d", None)
+            _cufft_eager_c2c = getattr(lib, "cufft_eager_c2c_1d", None)
+            _cufft_eager_fft_real = getattr(lib, "cufft_eager_fft_real_1d", None)
 
 
 def _fft_norm_scale(length, inverse, norm):
@@ -411,10 +429,42 @@ def _fft_core(value, size, dim, inverse, norm=None):
 
 
 def fft(input, n=None, dim=-1, norm=None):
+    if (n is None or (isinstance(input, jt.Var) and input.ndim > 0 and n == input.shape[-1])) and (
+        dim == -1 or (isinstance(input, jt.Var) and dim == input.ndim - 1)
+    ) and isinstance(input, jt.Var) and input.ndim > 0:
+        if not _cufft_eager_checked:
+            _ensure_cufft_eager()
+        if _cufft_eager_c2c is not None:
+            scale = _fft_norm_scale(int(input.shape[-1]), False, norm)
+            dname = _jittor_dtype_name(input.dtype)
+            if "complex" in dname:
+                res = _cufft_eager_c2c(input, False, float(scale))
+                if res is not None:
+                    return res
+            elif dname in ("float32", "float64") and _cufft_eager_fft_real is not None:
+                res = _cufft_eager_fft_real(input, False, float(scale))
+                if res is not None:
+                    return res
     return _fft_core(input, n, dim, False, norm)
 
 
 def ifft(input, n=None, dim=-1, norm=None):
+    if (n is None or (isinstance(input, jt.Var) and input.ndim > 0 and n == input.shape[-1])) and (
+        dim == -1 or (isinstance(input, jt.Var) and dim == input.ndim - 1)
+    ) and isinstance(input, jt.Var) and input.ndim > 0:
+        if not _cufft_eager_checked:
+            _ensure_cufft_eager()
+        if _cufft_eager_c2c is not None:
+            scale = _fft_norm_scale(int(input.shape[-1]), True, norm)
+            dname = _jittor_dtype_name(input.dtype)
+            if "complex" in dname:
+                res = _cufft_eager_c2c(input, True, float(scale))
+                if res is not None:
+                    return res
+            elif dname in ("float32", "float64") and _cufft_eager_fft_real is not None:
+                res = _cufft_eager_fft_real(input, True, float(scale))
+                if res is not None:
+                    return res
     return _fft_core(input, n, dim, True, norm)
 
 
@@ -449,6 +499,16 @@ def ifftn(input, s=None, dim=(-2, -1), norm=None):
 
 
 def rfft(input, n=None, dim=-1, norm=None):
+    if (n is None or (isinstance(input, jt.Var) and input.ndim > 0 and n == input.shape[-1])) and (
+        dim == -1 or (isinstance(input, jt.Var) and dim == input.ndim - 1)
+    ) and isinstance(input, jt.Var) and input.ndim > 0:
+        if not _cufft_eager_checked:
+            _ensure_cufft_eager()
+        if _cufft_eager_rfft is not None:
+            scale = _fft_norm_scale(int(input.shape[-1]), False, norm)
+            res = _cufft_eager_rfft(input, float(scale))
+            if res is not None:
+                return res
     length = input.shape[dim] if n is None else n
     keep = length // 2 + 1
     probe = input.real if isinstance(input, _ComplexNumber) else input
@@ -553,6 +613,14 @@ def irfft(input, n=None, dim=-1, norm=None):
     if length < 1:
         raise RuntimeError(
             f"irfft: invalid number of data points ({length}) specified")
+    if isinstance(input, jt.Var) and (dim == -1 or dim == input.ndim - 1):
+        if not _cufft_eager_checked:
+            _ensure_cufft_eager()
+        if _cufft_eager_irfft is not None:
+            scale = _fft_norm_scale(length, True, norm)
+            res = _cufft_eager_irfft(input, int(length), float(scale))
+            if res is not None:
+                return res
     if dispatch_context(real).backend == "cuda":
         fast = _cufft_irfft_1d(input, length, dim, norm=norm)
         if fast is not None:
