@@ -39,7 +39,8 @@ MARKER = "BENCH_RESULT "
 #: or point Jittor at another checkout's cache. Cleared for the torch side.
 JITTOR_VARIABLES = (
     "JITTOR_SOURCE_ROOT", "JITTOR_HOME", "JITTOR_TORCH_CACHE_ROOT",
-    "JITTOR_TORCH_SHIM", "JITTOR_TORCH_KEEP_HOME", "JT_BACKEND", "JT_USE_CUDA",
+    "JITTOR_TORCH_SHIM", "JITTOR_TORCH_KEEP_HOME", "JITTOR_TORCH_ISOLATE_HOME",
+    "JITTOR_SHARED_CACHE", "JT_BACKEND", "JT_USE_CUDA",
     "use_cuda", "cache_name",
 )
 
@@ -90,7 +91,7 @@ def environment_for(runtime, options, state):
         if options.device == "cpu":
             env["JT_BACKEND"] = "cpu"
             env["JT_USE_CUDA"] = "0"
-            env["use_cuda"] = "0"
+            env["CUDA_VISIBLE_DEVICES"] = ""
     if options.gpu is not None:
         visible = "ASCEND_RT_VISIBLE_DEVICES" if options.device == "npu" else "CUDA_VISIBLE_DEVICES"
         env[visible] = options.gpu

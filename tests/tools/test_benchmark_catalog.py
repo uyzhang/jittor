@@ -114,6 +114,18 @@ class BrokenBenchmarks:
         self.assertNotIn("torch-compat [", result.stdout)
         self.assertIn("not hardware validation", result.stdout)
 
+    def test_every_profiling_script_is_documented_in_readme(self):
+        """Prevent one-off probes from silently accumulating under benchmarks/profiling/."""
+        profiling_root = REPO / "benchmarks" / "profiling"
+        readme = (profiling_root / "README.md").read_text(encoding="utf-8")
+        undocumented = [
+            path.relative_to(profiling_root).as_posix()
+            for path in sorted(profiling_root.rglob("*.py"))
+            if not path.name.startswith("_")
+            and path.relative_to(profiling_root).as_posix() not in readme
+        ]
+        self.assertEqual(undocumented, [], f"Undocumented profiling scripts: {undocumented}")
+
 
 if __name__ == "__main__":
     unittest.main()

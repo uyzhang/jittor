@@ -30,7 +30,7 @@ if [[ -n "${JTCUDA:-}" ]]; then
     exit 2
   fi
   export CUDA_HOME="${CUDA_HOME:-$JTCUDA}"
-  export nvcc_path="${nvcc_path:-$JTCUDA/bin/nvcc}"
+  export JT_BUILD_NVCC_PATH="${JT_BUILD_NVCC_PATH:-$JTCUDA/bin/nvcc}"
   export PATH="$JTCUDA/bin:$PATH"
   export LD_LIBRARY_PATH="$JTCUDA/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
