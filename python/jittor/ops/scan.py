@@ -258,6 +258,7 @@ def _cummax_min(x, dim, is_max):
     FINITE sentinel (not +/-inf) to dodge jittor's inf/nan JIT codegen segfault, and
     jt.argmax (which picks the FIRST max -> matches torch's cummax tie behavior). '''
     import jittor as jt
+    from jittor._core.var import device_scope_like
     if dim is None:
         dim = x.ndim - 1
     d = dim if dim >= 0 else dim + x.ndim
@@ -266,28 +267,38 @@ def _cummax_min(x, dim, is_max):
     L = xt.shape[-1]
     tgt = list(xt.shape[:-1]) + [L, L]
     xe = xt.unsqueeze(-2).broadcast(tgt)                   # [...,i,j] = xt[...,j]
-    ii = jt.index((L, L), dim=0)
-    jj = jt.index((L, L), dim=1)
-    mask = (jj <= ii).broadcast(tgt)                       # valid where j<=i
     sentinel = -3.4e38 if is_max else 3.4e38
-    sval = jt.array(sentinel).cast(xt.dtype).broadcast(tgt)
-    masked = jt.ternary(mask, xe, sval)
-    # NB: native jt.argmax returns (indices, values); the torch_compat layer overrides
-    # it to indices-only, and overrides Var.max/min to return a (values, indices)
-    # namedtuple. Handle both so cummax works regardless of install state.
-    def _argidx(am):
-        return am[0] if isinstance(am, (tuple, list)) else am
-    def _vals(mm):
-        return mm.values if hasattr(mm, "values") else (
-            mm[0] if isinstance(mm, (tuple, list)) else mm)
-    if is_max:
-        vals = _vals(masked.max(dim=-1)); idxs = _argidx(jt.argmax(masked, -1))
-    else:
-        vals = _vals(masked.min(dim=-1)); idxs = _argidx(jt.argmin(masked, -1))
-    inv = [0] * x.ndim
-    for newpos, oldpos in enumerate(perm):
-        inv[oldpos] = newpos
-    return vals.permute(inv), idxs.int64().permute(inv)
+    backend = getattr(xt, "placement_backend", -1)
+    placement_token = None
+    if backend >= 0:
+        placement_token = jt.core._set_tensor_placement(
+            int(backend), max(int(getattr(xt, "device_id", 0)), 0))
+    try:
+        with device_scope_like(xt):
+            ii = jt.index((L, L), dim=0)
+            jj = jt.index((L, L), dim=1)
+            mask = (jj <= ii).broadcast(tgt)                   # valid where j<=i
+            sval = jt.array(sentinel).cast(xt.dtype).broadcast(tgt)
+            masked = jt.ternary(mask, xe, sval)
+            # NB: native jt.argmax returns (indices, values); the torch_compat layer overrides
+            # it to indices-only, and overrides Var.max/min to return a (values, indices)
+            # namedtuple. Handle both so cummax works regardless of install state.
+            def _argidx(am):
+                return am[0] if isinstance(am, (tuple, list)) else am
+            def _vals(mm):
+                return mm.values if hasattr(mm, "values") else (
+                    mm[0] if isinstance(mm, (tuple, list)) else mm)
+            if is_max:
+                vals = _vals(masked.max(dim=-1)); idxs = _argidx(jt.argmax(masked, -1))
+            else:
+                vals = _vals(masked.min(dim=-1)); idxs = _argidx(jt.argmin(masked, -1))
+            inv = [0] * x.ndim
+            for newpos, oldpos in enumerate(perm):
+                inv[oldpos] = newpos
+            return vals.permute(inv), idxs.int64().permute(inv)
+    finally:
+        if placement_token is not None:
+            jt.core._reset_tensor_placement(placement_token)
 
 
 def cummax(x, dim=None):

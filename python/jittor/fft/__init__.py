@@ -189,13 +189,14 @@ def irfft(input, n=None, dim=-1, norm=None):
     # Bin `length - k` is the conjugate of bin `k`; for even `length` the
     # Nyquist bin is its own mirror and must not be repeated.
     first_mirror = keep - 2 if length % 2 == 0 else keep - 1
-    mirror_indices = list(range(first_mirror, 0, -1))
-    if mirror_indices:
+    if first_mirror >= 1:
         slices = [slice(None)] * real.ndim
-        slices[dimension] = mirror_indices
+        slices[dimension] = slice(1, first_mirror + 1)
         mirrored = tuple(slices)
-        real = jt.concat([real, real[mirrored]], dim=dimension)
-        imag = jt.concat([imag, -imag[mirrored]], dim=dimension)
+        real_mirror = jt.flip(real[mirrored], dim=dimension)
+        imag_mirror = -jt.flip(imag[mirrored], dim=dimension)
+        real = jt.concat([real, real_mirror], dim=dimension)
+        imag = jt.concat([imag, imag_mirror], dim=dimension)
     return _fft_core(_make_complex(real, imag), None, dim, True, norm).real
 
 
