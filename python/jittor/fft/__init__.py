@@ -12,12 +12,313 @@ from collections import OrderedDict
 
 import jittor as jt
 from jittor import _arg_policy
+from jittor._core.var import device_scope_like
+from jittor._runtime.backend_libraries import get_library_ops
 from jittor._runtime.dispatch import dispatch_context
 
 
 _ComplexNumber = jt.nn.ComplexNumber
 _dft_mat_cache = OrderedDict()
 _dft_mat_cache_limit = 16
+_cufft_ops_cache = None
+_cufft_ops_checked = False
+
+
+def _get_cufft_ops():
+    global _cufft_ops_cache, _cufft_ops_checked
+    if not _cufft_ops_checked:
+        _cufft_ops_checked = True
+        _cufft_ops_cache = get_library_ops("cufft", load=True)
+    return _cufft_ops_cache
+
+
+def _fft_norm_scale(length, inverse, norm):
+    if norm == "ortho":
+        return 1.0 / (length ** 0.5)
+    if norm == "forward":
+        return (1.0 / length) if not inverse else 1.0
+    return (1.0 / length) if inverse else 1.0
+
+
+def _zeros_on(shape, dtype, like):
+    z = jt.zeros(shape, dtype)
+    ctx = dispatch_context(like)
+    if ctx.device_id >= 0:
+        z = z.to_device(ctx.device_id)
+    return z
+
+
+_REAL_TO_PAIR_HEADER = r"""
+template <typename T>
+__global__ void _jt_real_to_pair_k(const T* __restrict__ xp, T* __restrict__ yp, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += (int64_t)gridDim.x * blockDim.x) {
+        yp[i * 2] = xp[i];
+        yp[i * 2 + 1] = (T)0;
+    }
+}
+
+template <typename T>
+__global__ void _jt_pair_slice_scale_k(
+    const T* __restrict__ xp,
+    T* __restrict__ yp,
+    int64_t batch, int64_t full_len, int64_t keep_len, T scale
+) {
+    const int64_t total = batch * keep_len;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (int64_t)gridDim.x * blockDim.x) {
+        const int64_t b = idx / keep_len;
+        const int64_t k = idx - b * keep_len;
+        const int64_t src = (b * full_len + k) * 2;
+        const int64_t dst = idx * 2;
+        yp[dst] = xp[src] * scale;
+        yp[dst + 1] = xp[src + 1] * scale;
+    }
+}
+
+template <typename T>
+__global__ void _jt_pair_to_real_k(const T* __restrict__ xp, T* __restrict__ yp, int64_t n, T scale) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += (int64_t)gridDim.x * blockDim.x) {
+        yp[i] = xp[i * 2] * scale;
+    }
+}
+
+template <typename T>
+__global__ void _jt_irfft_mirror_pair_k(
+    const T* __restrict__ xp,
+    T* __restrict__ yp,
+    int64_t batch, int64_t in_len, int64_t keep, int64_t full_len
+) {
+    const int64_t total = batch * full_len;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (int64_t)gridDim.x * blockDim.x) {
+        const int64_t b = idx / full_len;
+        const int64_t k = idx - b * full_len;
+        const int64_t dst = idx * 2;
+        if (k < keep) {
+            if (k < in_len) {
+                const int64_t src = (b * in_len + k) * 2;
+                yp[dst] = xp[src];
+                yp[dst + 1] = xp[src + 1];
+            } else {
+                yp[dst] = (T)0;
+                yp[dst + 1] = (T)0;
+            }
+        } else {
+            const int64_t mk = full_len - k;
+            if (mk < in_len) {
+                const int64_t src = (b * in_len + mk) * 2;
+                yp[dst] = xp[src];
+                yp[dst + 1] = -xp[src + 1];
+            } else {
+                yp[dst] = (T)0;
+                yp[dst + 1] = (T)0;
+            }
+        }
+    }
+}
+"""
+
+
+class _RealToPairCuda(jt.Function):
+    def execute(self, real):
+        rc = real.contiguous()
+        out_shape = list(rc.shape) + [2]
+        with device_scope_like(rc):
+            return jt.code(
+                out_shape,
+                rc.dtype,
+                [rc],
+                cuda_header=_REAL_TO_PAIR_HEADER,
+                cuda_src="""
+                const int64_t n = (int64_t)in0->num;
+                if (n > 0) {
+                    constexpr int threads = 256;
+                    const int64_t raw_blocks = (n + threads - 1) / threads;
+                    const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                    _jt_real_to_pair_k<in0_type><<<blocks, threads>>>(in0_p, out0_p, n);
+                    CHECK(0 == cudaGetLastError());
+                }
+                """,
+            )
+
+    def grad(self, dout):
+        if dout is None:
+            return None
+        dc = dout.contiguous()
+        out_shape = list(dc.shape[:-1])
+        with device_scope_like(dc):
+            return jt.code(
+                out_shape,
+                dc.dtype,
+                [dc],
+                cuda_header=_REAL_TO_PAIR_HEADER,
+                cuda_src="""
+                const int64_t n = (int64_t)out0->num;
+                if (n > 0) {
+                    constexpr int threads = 256;
+                    const int64_t raw_blocks = (n + threads - 1) / threads;
+                    const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                    _jt_pair_to_real_k<in0_type><<<blocks, threads>>>(in0_p, out0_p, n, (in0_type)1);
+                    CHECK(0 == cudaGetLastError());
+                }
+                """,
+            )
+
+
+def _as_real_pair(value, size):
+    """Convert real or complex ``value`` (with transform on last dim) to ``[..., L, 2]``."""
+    is_native_complex = (
+        isinstance(value, jt.Var)
+        and "complex" in _jittor_dtype_name(value.dtype)
+    )
+    if is_native_complex:
+        pair = jt.nn.view_as_real(value)
+        if size is not None:
+            length = pair.shape[-2]
+            if length > size:
+                pair = pair[..., :size, :]
+            elif length < size:
+                pad_shape = list(pair.shape[:-2]) + [size - length, 2]
+                pair = jt.concat([pair, _zeros_on(pad_shape, pair.dtype, pair)], dim=-2)
+        return pair
+    real0, imag0 = _real_imag(value)
+    real = _resize_last(real0, size)
+    rname = _jittor_dtype_name(real.dtype)
+    if rname not in ("float32", "float64"):
+        real = real.float32()
+    if imag0 is None:
+        if dispatch_context(real).backend == "cuda":
+            if jt.flags.no_grad:
+                rc = real.contiguous()
+                with device_scope_like(rc):
+                    return jt.code(
+                        list(rc.shape) + [2],
+                        rc.dtype,
+                        [rc],
+                        cuda_header=_REAL_TO_PAIR_HEADER,
+                        cuda_src="""
+                        const int64_t n = (int64_t)in0->num;
+                        if (n > 0) {
+                            constexpr int threads = 256;
+                            const int64_t raw_blocks = (n + threads - 1) / threads;
+                            const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                            _jt_real_to_pair_k<in0_type><<<blocks, threads>>>(in0_p, out0_p, n);
+                            CHECK(0 == cudaGetLastError());
+                        }
+                        """,
+                    )
+            return _RealToPairCuda()(real)
+        imag = _zeros_on(real.shape, real.dtype, real)
+    else:
+        imag = _resize_last(imag0, size)
+        if _jittor_dtype_name(imag.dtype) != _jittor_dtype_name(real.dtype):
+            imag = imag.cast(real.dtype)
+    return jt.stack([real, imag], dim=-1)
+
+
+def _cufft_1d(value, size, dim, inverse, norm=None, keep=None):
+    ops = _get_cufft_ops()
+    if ops is None:
+        return None
+    probe = value.real if isinstance(value, _ComplexNumber) else value
+    with device_scope_like(probe):
+        moved, restore = _to_last(value, dim)
+        pair = _as_real_pair(moved, size)
+        dtype_name = _jittor_dtype_name(pair.dtype)
+        if dtype_name not in ("float32", "float64"):
+            return None
+        length = int(pair.shape[-2])
+        if length <= 0 or pair.numel() == 0:
+            return None
+        batch = int(pair.numel() // (length * 2))
+        out_pair = ops.cufft_fft(pair.reshape([batch, 1, length, 2]), bool(inverse))
+        scale = _fft_norm_scale(length, inverse, norm)
+        out_len = keep if (keep is not None and keep < length) else length
+        if jt.flags.no_grad and (out_len < length or scale != 1.0):
+            out_pair = jt.code(
+                [batch, 1, out_len, 2],
+                out_pair.dtype,
+                [out_pair],
+                cuda_header=_REAL_TO_PAIR_HEADER,
+                cuda_src="""
+                const int64_t batch = (int64_t)in0->shape[0];
+                const int64_t full_len = (int64_t)in0->shape[2];
+                const int64_t keep_len = (int64_t)out0->shape[2];
+                const int64_t total = batch * keep_len;
+                const in0_type scale = (in0_type)data["scale"];
+                if (total > 0) {
+                    constexpr int threads = 256;
+                    const int64_t raw_blocks = (total + threads - 1) / threads;
+                    const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                    _jt_pair_slice_scale_k<in0_type><<<blocks, threads>>>(
+                        in0_p, out0_p, batch, full_len, keep_len, scale);
+                    CHECK(0 == cudaGetLastError());
+                }
+                """,
+                data={"scale": float(scale)},
+            )
+            out_pair = out_pair.reshape(list(pair.shape[:-2]) + [out_len, 2])
+        else:
+            out_pair = out_pair.reshape(list(pair.shape[:-2]) + [length, 2])
+            if out_len < length:
+                out_pair = out_pair[..., :out_len, :].contiguous()
+            if scale != 1.0:
+                out_pair = out_pair * scale
+        output = jt.nn.view_as_complex(out_pair)
+        if restore is not None:
+            output = output.permute(*restore)
+        return output
+
+
+def _cufft_2d(value, sizes, dims, inverse, norm=None):
+    ops = _get_cufft_ops()
+    if ops is None or len(dims) != 2:
+        return None
+    ndim = value.real.ndim if isinstance(value, _ComplexNumber) else value.ndim
+    if ndim < 2:
+        return None
+    d0 = dims[0] if dims[0] >= 0 else dims[0] + ndim
+    d1 = dims[1] if dims[1] >= 0 else dims[1] + ndim
+    if d0 == d1:
+        return None
+    probe = value.real if isinstance(value, _ComplexNumber) else value
+    with device_scope_like(probe):
+        if d0 == ndim - 2 and d1 == ndim - 1:
+            moved, restore = value, None
+        else:
+            perm = [a for a in range(ndim) if a not in (d0, d1)] + [d0, d1]
+            restore = [0] * ndim
+            for new_a, old_a in enumerate(perm):
+                restore[old_a] = new_a
+            moved = value.permute(*perm)
+        s0 = sizes[0] if sizes is not None else None
+        s1 = sizes[1] if sizes is not None else None
+        pair = _as_real_pair(moved, s1)
+        if s0 is not None:
+            pair = _resize_at(pair, pair.ndim - 3, s0)
+        dtype_name = _jittor_dtype_name(pair.dtype)
+        if dtype_name not in ("float32", "float64"):
+            return None
+        h = int(pair.shape[-3])
+        w = int(pair.shape[-2])
+        if h <= 0 or w <= 0 or pair.numel() == 0:
+            return None
+        batch = int(pair.numel() // (h * w * 2))
+        out_pair = ops.cufft_fft(pair.reshape([batch, h, w, 2]), bool(inverse))
+        out_pair = out_pair.reshape(list(pair.shape[:-3]) + [h, w, 2])
+        scale = _fft_norm_scale(h * w, inverse, norm)
+        if scale != 1.0:
+            out_pair = out_pair * scale
+        output = jt.nn.view_as_complex(out_pair.contiguous())
+        if restore is not None:
+            output = output.permute(*restore)
+        return output
 
 
 def _dft_mats(size, inverse, like):
@@ -63,7 +364,7 @@ def _resize_last(value, size):
         return value
     if length > size:
         return value[..., :size]
-    padding = jt.zeros(list(value.shape[:-1]) + [size - length], value.dtype)
+    padding = _zeros_on(list(value.shape[:-1]) + [size - length], value.dtype, value)
     return jt.concat([value, padding], dim=-1)
 
 
@@ -80,6 +381,11 @@ def _real_imag(value):
 
 
 def _fft_core(value, size, dim, inverse, norm=None):
+    probe = value.real if isinstance(value, _ComplexNumber) else value
+    if dispatch_context(probe).backend == "cuda":
+        fast = _cufft_1d(value, size, dim, inverse, norm=norm)
+        if fast is not None:
+            return fast
     value, restore = _to_last(value, dim)
     real0, imag0 = _real_imag(value)
     real = _resize_last(real0, size)
@@ -93,12 +399,7 @@ def _fft_core(value, size, dim, inverse, norm=None):
         out_real = out_real - jt.matmul(imag, sine.transpose(1, 0))
         out_imag = out_imag + jt.matmul(imag, cosine.transpose(1, 0))
 
-    if norm == "ortho":
-        scale = 1.0 / (length ** 0.5)
-    elif norm == "forward":
-        scale = (1.0 / length) if not inverse else 1.0
-    else:
-        scale = (1.0 / length) if inverse else 1.0
+    scale = _fft_norm_scale(length, inverse, norm)
     if scale != 1.0:
         out_real = out_real * scale
         out_imag = out_imag * scale
@@ -118,9 +419,14 @@ def ifft(input, n=None, dim=-1, norm=None):
 
 
 def _fftn(input, sizes=None, dims=(-2, -1), norm=None, inverse=False):
-    output = input
     dimensions = list(dims)
     lengths = list(sizes) if sizes is not None else [None] * len(dimensions)
+    probe = input.real if isinstance(input, _ComplexNumber) else input
+    if len(dimensions) == 2 and dispatch_context(probe).backend == "cuda":
+        fast = _cufft_2d(input, lengths, dimensions, inverse, norm=norm)
+        if fast is not None:
+            return fast
+    output = input
     for dim, size in zip(dimensions, lengths):
         output = _fft_core(output, size, dim, inverse, norm)
     return output
@@ -143,9 +449,14 @@ def ifftn(input, s=None, dim=(-2, -1), norm=None):
 
 
 def rfft(input, n=None, dim=-1, norm=None):
-    full = _fft_core(input, n, dim, False, norm)
     length = input.shape[dim] if n is None else n
     keep = length // 2 + 1
+    probe = input.real if isinstance(input, _ComplexNumber) else input
+    if dispatch_context(probe).backend == "cuda":
+        fast = _cufft_1d(input, n, dim, False, norm=norm, keep=keep)
+        if fast is not None:
+            return fast
+    full = _fft_core(input, n, dim, False, norm)
     real, imag = full.real, full.imag
     slices = [slice(None)] * real.ndim
     slices[dim if dim >= 0 else dim + real.ndim] = slice(0, keep)
@@ -164,7 +475,71 @@ def _resize_at(value, dim, size):
         return value[tuple(slices)]
     padding = list(value.shape)
     padding[dim] = size - length
-    return jt.concat([value, jt.zeros(padding, value.dtype)], dim=dim)
+    return jt.concat([value, _zeros_on(padding, value.dtype, value)], dim=dim)
+
+
+def _cufft_irfft_1d(value, length, dim, norm=None):
+    ops = _get_cufft_ops()
+    if ops is None or not jt.flags.no_grad:
+        return None
+    probe = value.real if isinstance(value, _ComplexNumber) else value
+    with device_scope_like(probe):
+        moved, restore = _to_last(value, dim)
+        pair = _as_real_pair(moved, None)
+        dtype_name = _jittor_dtype_name(pair.dtype)
+        if dtype_name not in ("float32", "float64"):
+            return None
+        in_len = int(pair.shape[-2])
+        if length <= 0 or in_len <= 0 or pair.numel() == 0:
+            return None
+        keep = length // 2 + 1
+        batch = int(pair.numel() // (in_len * 2))
+        in_flat = pair.contiguous().reshape([batch, in_len, 2])
+        full_pair = jt.code(
+            [batch, 1, length, 2],
+            pair.dtype,
+            [in_flat],
+            cuda_header=_REAL_TO_PAIR_HEADER,
+            cuda_src="""
+            const int64_t batch = (int64_t)in0->shape[0];
+            const int64_t in_len = (int64_t)in0->shape[1];
+            const int64_t full_len = (int64_t)out0->shape[2];
+            const int64_t keep = full_len / 2 + 1;
+            const int64_t total = batch * full_len;
+            if (total > 0) {
+                constexpr int threads = 256;
+                const int64_t raw_blocks = (total + threads - 1) / threads;
+                const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                _jt_irfft_mirror_pair_k<in0_type><<<blocks, threads>>>(
+                    in0_p, out0_p, batch, in_len, keep, full_len);
+                CHECK(0 == cudaGetLastError());
+            }
+            """,
+        )
+        out_pair = ops.cufft_fft(full_pair, True)
+        scale = _fft_norm_scale(length, True, norm)
+        out_real = jt.code(
+            [batch, length],
+            pair.dtype,
+            [out_pair],
+            cuda_header=_REAL_TO_PAIR_HEADER,
+            cuda_src="""
+            const int64_t n = (int64_t)out0->num;
+            const in0_type scale = (in0_type)data["scale"];
+            if (n > 0) {
+                constexpr int threads = 256;
+                const int64_t raw_blocks = (n + threads - 1) / threads;
+                const int blocks = (int)(raw_blocks > 65535 ? 65535 : raw_blocks);
+                _jt_pair_to_real_k<in0_type><<<blocks, threads>>>(in0_p, out0_p, n, scale);
+                CHECK(0 == cudaGetLastError());
+            }
+            """,
+            data={"scale": float(scale)},
+        )
+        out_real = out_real.reshape(list(pair.shape[:-2]) + [length])
+        if restore is not None:
+            out_real = out_real.permute(*restore)
+        return out_real
 
 
 def irfft(input, n=None, dim=-1, norm=None):
@@ -178,26 +553,29 @@ def irfft(input, n=None, dim=-1, norm=None):
     if length < 1:
         raise RuntimeError(
             f"irfft: invalid number of data points ({length}) specified")
+    if dispatch_context(real).backend == "cuda":
+        fast = _cufft_irfft_1d(input, length, dim, norm=norm)
+        if fast is not None:
+            return fast
     # The half spectrum that describes a signal of `length` samples has exactly
     # length//2 + 1 entries, so resize the input to that before mirroring it.
     # Resizing the *mirrored* spectrum instead (which is what passing `length`
     # to _fft_core did) truncates or pads in the middle of the conjugate pairs.
     keep = length // 2 + 1
-    real = _resize_at(real, dimension, keep)
-    imag = (jt.zeros(real.shape, real.dtype) if imag is None
-            else _resize_at(imag, dimension, keep))
-    # Bin `length - k` is the conjugate of bin `k`; for even `length` the
-    # Nyquist bin is its own mirror and must not be repeated.
-    first_mirror = keep - 2 if length % 2 == 0 else keep - 1
-    if first_mirror >= 1:
-        slices = [slice(None)] * real.ndim
-        slices[dimension] = slice(1, first_mirror + 1)
-        mirrored = tuple(slices)
-        real_mirror = jt.flip(real[mirrored], dim=dimension)
-        imag_mirror = -jt.flip(imag[mirrored], dim=dimension)
-        real = jt.concat([real, real_mirror], dim=dimension)
-        imag = jt.concat([imag, imag_mirror], dim=dimension)
-    return _fft_core(_make_complex(real, imag), None, dim, True, norm).real
+    with device_scope_like(real):
+        real = _resize_at(real, dimension, keep)
+        imag = (_zeros_on(real.shape, real.dtype, real) if imag is None
+                else _resize_at(imag, dimension, keep))
+        # Bin `length - k` is the conjugate of bin `k`; for even `length` the
+        # Nyquist bin is its own mirror and must not be repeated.
+        first_mirror = keep - 2 if length % 2 == 0 else keep - 1
+        if first_mirror >= 1:
+            slices = [slice(None)] * real.ndim
+            slices[dimension] = slice(1, first_mirror + 1)
+            mirrored = tuple(slices)
+            real = jt.concat([real, jt.flip(real[mirrored], dim=dimension)], dim=dimension)
+            imag = jt.concat([imag, -jt.flip(imag[mirrored], dim=dimension)], dim=dimension)
+        return _fft_core(_make_complex(real, imag), None, dim, True, norm).real
 
 
 def _shift_dims(value, dim, inverse):

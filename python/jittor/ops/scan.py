@@ -224,6 +224,12 @@ def cumprod(x,dim=None):
     # which can trip jittor's inf/nan JIT codegen; positions at/after the first zero are
     # forced to 0). Reduces to the old behaviour for all-positive input.
     import jittor as jt
+    dim = jt.misc._cumsum_dim(dim, x.ndim)
+    if x.numel() == 0:
+        return x.clone()
+    result = try_dispatch("tensor.cumprod", x, dim)
+    if result is not None:
+        return result
     mag = jt.abs(x)
     is_zero = (mag == 0)
     mag_safe = jt.ternary(is_zero, jt.ones_like(mag), mag)
