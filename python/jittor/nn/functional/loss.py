@@ -6,6 +6,8 @@ from jittor._runtime.dispatch import dispatch_context, try_dispatch
 
 from .vector import cosine_similarity
 
+from jittor.backends.cuda.kernels.nn import loss_cuda as _cuda_loss_kernels  # noqa: F401
+
 #: the reductions every torch loss accepts
 _REDUCTIONS = ("none", "mean", "sum")
 
@@ -147,12 +149,12 @@ def _checked_class_target(target, classes, ignore_index):
 
 
 def cross_entropy_loss(output, target, weight=None, ignore_index=None,reduction='mean'):
-    if output.ndim >= 2:
-        target = _checked_class_target(target, int(output.shape[1]), ignore_index)
     fast = try_dispatch("nn.cross_entropy_loss", output, target, weight=weight,
                         ignore_index=ignore_index, reduction=reduction)
     if fast is not None:
         return fast
+    if output.ndim >= 2:
+        target = _checked_class_target(target, int(output.shape[1]), ignore_index)
     target_shape = target.shape
     if len(output.shape) == 4:
         c_dim = output.shape[1]
@@ -317,6 +319,14 @@ def nll_loss(output,target,weight=None,ignore_index=-100,reduction='mean'):
     assert ignore_index<0 or ignore_index<n_classes, (
         f"nll_loss ignore_index {ignore_index} is out of range for "
         f"{n_classes} classes")
+    _check_reduction(reduction)
+    fast = try_dispatch("nn.nll_loss", output, target, weight=weight,
+                        ignore_index=ignore_index, reduction=reduction)
+    if fast is not None:
+        return fast
+    if weight is None and ignore_index < 0 and output.ndim == 2:
+        loss = -output.reindex([output.shape[0]], ["i0", "@e0(i0)"], extras=[target])
+        return _reduce(loss, reduction)
     if weight is None:
         weight = jt.ones((n_classes,))
     # torch ignores the class `ignore_index` (any value >=0 is a valid class id, incl.
@@ -331,7 +341,6 @@ def nll_loss(output,target,weight=None,ignore_index=-100,reduction='mean'):
         loss = -output[index,target]*weight[target]
     else:
         loss = -output[target[0]]*weight[target[0]]
-    _check_reduction(reduction)
     if reduction=="mean":
         total_weight  = weight[target].sum() if output.ndim==2 else weight[target[0]].sum()
         return loss.sum()/total_weight
@@ -344,17 +353,25 @@ def binary_cross_entropy_with_logits(output, target, weight=None, pos_weight=Non
     if not (target.shape == output.shape):
         raise ValueError(f"Target size ({target.shape}) must be the same as output size ({output.shape})")
 
+    eff_reduction = reduction if reduction is not None else ("mean" if size_average else "sum")
+    if weight is None and pos_weight is None and eff_reduction in _REDUCTIONS:
+        fast = try_dispatch("nn.bce_with_logits", output, target,
+                            weight=None, pos_weight=None, reduction=eff_reduction)
+        if fast is not None:
+            return fast
+
     # The stable formula below is exact for any FINITE logit, but literal +/-inf
     # (e.g. Grounding-DINO's ContrastiveEmbed masks padding logits with -inf) makes
     # (1-target)*(-inf) and inf-inf produce NaN. Clamp to +/-50 — sigmoid is fully
     # saturated there, so loss/grad for finite logits are unchanged; only inf is removed.
-    output = jt.clamp(output, -50.0, 50.0)
-    max_val = jt.clamp(-output,min_v=0)
+    output = jt.minimum(jt.maximum(output, -50.0), 50.0)
+    max_val = jt.maximum(-output, 0.0)
+    log_term = jt.log1p((-jt.abs(output)).exp())
     if pos_weight is not None:
         log_weight = (pos_weight-1)*target + 1
-        loss = (1-target)*output+(log_weight*(((-max_val).exp()+(-output - max_val).exp()).log()+max_val))
+        loss = (1-target)*output + log_weight * (log_term + max_val)
     else:
-        loss = (1-target)*output+max_val+((-max_val).exp()+(-output -max_val).exp()).log()
+        loss = (1-target)*output + max_val + log_term
     if weight is not None:
         loss *=weight
 
