@@ -53,9 +53,11 @@ python examples/pytorch/xla_spawn.py --num_cores 2 train_script.py ...
 
 ## 缓存与项目扩展
 
-需要固定兼容运行时位置时，可在启动应用前设置 `JITTOR_TORCH_RUNTIME_ROOT`。默认运行时位于 `${XDG_CACHE_HOME:-~/.cache}/jittor/torch-shim/`。原生 Jittor 的编译缓存与兼容运行时不是同一个概念，维护多个环境时应分别确认其位置。
+兼容引导默认保留进程原有的 `HOME`、`XDG_CACHE_HOME`、`PIP_CACHE_DIR` 和 `TMPDIR`（不再为了保持真实主目录而设置 `JITTOR_TORCH_KEEP_HOME=1`），并在未显式指定 `JITTOR_HOME` 时默认复用用户级 Jittor 编译缓存以及 `JITTOR_SHARED_CACHE` 共享缓存；单进程默认不加载 MPI/NCCL，且自动识别 `CUDA_HOME` / `CUDA_PATH` 下的 `nvcc`（无需手工重复设置 `JT_BUILD_NVCC_PATH` 或 `JT_BUILD_USE_MPI=0` / `JT_BUILD_USE_NCCL=0`）。
 
-兼容引导可以发现项目的源码扩展并通过 Jittor 支撑的构建接口处理；这并不意味着任意 PyTorch 二进制扩展都能直接加载。遇到构建失败，应保留编译器输出并核对集成仓库的扩展要求。
+- 需要按项目隔离沙盒主目录与临时目录时，显式设置 `JITTOR_TORCH_ISOLATE_HOME=1`（或传入 `activate(local_home=True)`）。
+- 需要固定兼容运行时位置时，可在启动应用前设置 `JITTOR_TORCH_RUNTIME_ROOT`（默认位于 `${XDG_CACHE_HOME:-~/.cache}/jittor/torch-shim/`）。
+- 兼容引导默认不会在 `import torch` / `activate()` 时自动编译当前工作目录下的源码扩展（不再需要设置 `JITTOR_TORCH_SKIP_EXT_BUILD=1`）；需要自动构建项目扩展时，显式设置 `JITTOR_TORCH_AUTO_BUILD_EXT=1` 或传入 `activate(build_extensions=True)`。这并不意味着任意 PyTorch 二进制扩展都能直接加载；遇到构建失败时，应保留编译器输出并核对集成仓库的扩展要求。
 
 ## 下游适配器
 

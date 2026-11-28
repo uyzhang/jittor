@@ -53,9 +53,11 @@ python examples/pytorch/xla_spawn.py --num_cores 2 train_script.py ...
 
 ## Caches and project extensions
 
-Set `JITTOR_TORCH_RUNTIME_ROOT` before starting the application when you need a fixed runtime location. The default is `${XDG_CACHE_HOME:-~/.cache}/jittor/torch-shim/`. Native Jittor's compilation cache and the compatibility runtime are separate concepts; check their locations when maintaining multiple environments.
+By default, compatibility bootstrap preserves the caller's `HOME`, `XDG_CACHE_HOME`, `PIP_CACHE_DIR`, and `TMPDIR` (so `JITTOR_TORCH_KEEP_HOME=1` is no longer needed), reuses the user-level Jittor compilation cache together with `JITTOR_SHARED_CACHE` when `JITTOR_HOME` is unset, skips MPI/NCCL in single-process runs, and honors `CUDA_HOME` / `CUDA_PATH` for `nvcc` (so `JT_BUILD_NVCC_PATH`, `JT_BUILD_USE_MPI=0`, and `JT_BUILD_USE_NCCL=0` are no longer required).
 
-Compatibility bootstrap can discover source extensions and process them through Jittor-backed build interfaces. This does not imply that arbitrary PyTorch binary extensions can be loaded. Keep compiler output when a build fails and check the integration repository's extension requirements.
+- To isolate `HOME` and `TMPDIR` inside a per-project sandbox, opt in explicitly with `JITTOR_TORCH_ISOLATE_HOME=1` (or `activate(local_home=True)`).
+- Set `JITTOR_TORCH_RUNTIME_ROOT` before starting the application when you need a fixed runtime location (the default is `${XDG_CACHE_HOME:-~/.cache}/jittor/torch-shim/`).
+- Compatibility bootstrap no longer builds source extensions under the current working directory automatically on `import torch` / `activate()` (so `JITTOR_TORCH_SKIP_EXT_BUILD=1` is no longer needed). Opt in explicitly with `JITTOR_TORCH_AUTO_BUILD_EXT=1` or `activate(build_extensions=True)`. This does not imply that arbitrary PyTorch binary extensions can be loaded; keep compiler output when a build fails and check the integration repository's extension requirements.
 
 ## Downstream adapters
 

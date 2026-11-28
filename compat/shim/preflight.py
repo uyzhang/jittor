@@ -333,11 +333,21 @@ def _best_jtcuda(environ, real_home):
 def _configure_cuda(environ, real_home):
     if is_truthy(environ.get("JITTOR_TORCH_KEEP_CUDA")):
         return None
+    if environ.get("JT_BUILD_NVCC_PATH") is not None or environ.get("nvcc_path") is not None:
+        return None
+    nvcc_exe = "nvcc.exe" if os.name == "nt" else "nvcc"
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_home = environ.get(env_name)
+        if cuda_home:
+            nvcc_candidate = pathlib.Path(cuda_home) / "bin" / nvcc_exe
+            if nvcc_candidate.is_file():
+                environ.setdefault("JT_BUILD_NVCC_PATH", os.fspath(nvcc_candidate))
+                return None
     jtcuda = _best_jtcuda(environ, real_home)
     if jtcuda is None:
         return None
     environ.setdefault("JTCUDA", os.fspath(jtcuda))
-    environ.setdefault("nvcc_path", os.fspath(jtcuda / "bin" / "nvcc"))
+    environ.setdefault("JT_BUILD_NVCC_PATH", os.fspath(jtcuda / "bin" / "nvcc"))
     environ.setdefault("CUDA_HOME", os.fspath(jtcuda))
     _prepend_env_path(environ, "PATH", jtcuda / "bin")
     _prepend_env_path(environ, "LD_LIBRARY_PATH", jtcuda / "lib64")
@@ -377,17 +387,18 @@ _WORLD_SIZE_ENV = (
     "WORLD_SIZE",
 )
 
-#: Written next to ``use_nccl`` whenever *preflight* chose its value, holding
-#: the value it chose. See :func:`_choose_nccl`.
+#: Written next to ``JT_BUILD_USE_NCCL`` / ``JT_BUILD_USE_MPI`` whenever
+#: *preflight* chose its value, holding the value it chose.
 _NCCL_CHOSEN_BY_SHIM = "JITTOR_TORCH_SHIM_CHOSE_NCCL"
+_MPI_CHOSEN_BY_SHIM = "JITTOR_TORCH_SHIM_CHOSE_MPI"
 
 
 def _launched_with_multiple_ranks(env):
     """Whether this process is one rank of a multi-rank job.
 
     Read from the environment because it has to be answered *before* the core
-    is imported -- `use_nccl` is consumed once, by `setup_nccl()`, during that
-    import. `jt.world_size` does not exist yet here.
+    is imported -- ``setup_nccl()`` and ``setup_mpi()`` read these once during
+    that import. ``jt.world_size`` does not exist yet here.
     """
     for name in _WORLD_SIZE_ENV:
         raw = env.get(name)
@@ -401,43 +412,39 @@ def _launched_with_multiple_ranks(env):
     return False
 
 
-def _choose_nccl(env):
-    """Decide ``use_nccl`` for *this* process, overruling only our own default.
+def _choose_distributed_extern(env, canonical, legacy, marker):
+    """Decide a distributed extern flag for *this* process without overruling
+    a user-supplied value, and reconsidering only our own prior default.
 
-    NCCL belongs to an explicitly configured distributed run -- and being
-    started by a launcher with more than one rank IS that configuration.
-
-    Two things make this harder than a `setdefault`.
-
-    *It has to be decided here.* ``compile_extern.setup_nccl()`` reads
-    ``use_nccl`` exactly once, during ``import jittor``, and the one place that
-    used to set it back to "1" (``installers/distributed.py``) runs *after*
-    that import. So under ``import jittor as torch`` there was no way to reach
-    NCCL at all: every FSDP2 shard gather raised "Jittor NCCL all_gather is not
-    available", on every rank, always. Turning NCCL on later, from inside a
-    collective, initialises a communicator underneath a graph that is already
-    executing, and the next matmul dies with CUBLAS_STATUS_EXECUTION_FAILED.
-
-    *A default written into ``os.environ`` is inherited by every child.* This
-    function runs on every ``import jittor``, in the launching process as well
-    as in the ranks. A single-rank launcher that writes ``use_nccl=0`` for
-    itself hands the ranks it then starts under ``mpirun`` an *explicit* "0" --
-    at which point a `setdefault` in the rank is a no-op and multi-rank FSDP2
-    is off again, having been switched off by a process that was never part of
-    the job. That is not hypothetical: it is why the FSDP2 multi-rank test
-    failed while the same script run straight under ``mpirun`` passed.
-
-    So the value we write is stamped with the marker below, and we may
-    reconsider a value only when the marker says we are the ones who wrote it.
-    A user's own ``use_nccl=...`` carries no marker and is left exactly alone.
+    See :func:`_choose_nccl`: a single-rank launcher that defaults an extern to
+    ``"0"`` stamps ``marker`` so child ranks spawned under ``mpirun`` or
+    ``torchrun`` can flip it back to ``"1"``; any explicit user setting carries
+    no matching marker and is preserved verbatim.
     """
     wanted = "1" if _launched_with_multiple_ranks(env) else "0"
-    current = env.get("use_nccl")
-    if current is not None and env.get(_NCCL_CHOSEN_BY_SHIM) != current:
+    explicit_legacy = env.get(legacy)
+    if explicit_legacy is not None and env.get(marker) != explicit_legacy:
+        return explicit_legacy
+    current = env.get(canonical)
+    if current is not None and env.get(marker) != current:
         return current
-    env["use_nccl"] = wanted
-    env[_NCCL_CHOSEN_BY_SHIM] = wanted
+    env[canonical] = wanted
+    env[marker] = wanted
     return wanted
+
+
+def _choose_nccl(env):
+    """Decide ``JT_BUILD_USE_NCCL`` for *this* process, overruling only our own default."""
+    return _choose_distributed_extern(
+        env, "JT_BUILD_USE_NCCL", "use_nccl", _NCCL_CHOSEN_BY_SHIM
+    )
+
+
+def _choose_mpi(env):
+    """Decide ``JT_BUILD_USE_MPI`` for *this* process, overruling only our own default."""
+    return _choose_distributed_extern(
+        env, "JT_BUILD_USE_MPI", "use_mpi", _MPI_CHOSEN_BY_SHIM
+    )
 
 
 def prepare_import_environment(
@@ -446,7 +453,7 @@ def prepare_import_environment(
     project_root=None,
     runtime_root=None,
     force=False,
-    local_home=True,
+    local_home=False,
     configure_cuda=True,
 ):
     """Prepare the shim environment before native compiler/core import."""
@@ -496,42 +503,75 @@ def prepare_import_environment(
     env.setdefault("REAL_HOME", real_home)
     env["JITTOR_TORCH_PROJECT_ROOT"] = os.fspath(project)
     env["JITTOR_TORCH_RUNTIME_ROOT"] = os.fspath(runtime)
-    # The optional accelerator externs below stay off: measurements on cuDNN and
-    # cuBLAS show no benefit from cuTT or CUTLASS for the shim's workloads.
+    # The optional accelerator externs below stay off by default for shim runs:
+    # measurements on cuDNN and cuBLAS show no benefit from cuTT or CUTLASS for
+    # Torch compatibility workloads. Use canonical JT_BUILD_* names to avoid
+    # deprecation warnings, while honoring any explicit legacy spelling.
     #
     # oneDNN is deliberately NOT in that list. Turning it off removes the
     # `mkl_conv` and `mkl_matmul` relays, so every CPU convolution falls back to
     # the generic reindex kernel: a 4x64x32x32 conv went from 1.4ms to 156ms and
     # a 512x512 matmul from 0.6ms to 11ms. That made ordinary CPU inference under
     # `import torch` unusable, which is the opposite of what the shim is for.
+    #
+    # DISABLE_MULTIPROCESSING is also NOT forced here: forcing it serialized
+    # jittor_core's 260+ TU build onto a single core and forced DataLoader
+    # num_workers=0 in ordinary user scripts.
     defaults = [
         ("JITTOR_TORCH_SHIM", "1"),
         ("FIX_TORCH_ERROR", "0"),
-        ("DISABLE_MULTIPROCESSING", "1"),
-        ("use_cutt", "0"),
         ("use_cutlass", "0"),
     ]
-    # `use_nccl` is not in that list: unlike the others its right value depends
-    # on how *this* process was launched, so it cannot be inherited from the
-    # process that started us. See _choose_nccl.
+    if env.get("JT_BUILD_USE_CUTT") is None and env.get("use_cutt") is None:
+        env["JT_BUILD_USE_CUTT"] = "0"
     _choose_nccl(env)
+    _choose_mpi(env)
     for name, value in defaults:
         env.setdefault(name, value)
-    for name, subdir in (
-        ("JITTOR_HOME", "jittor_cache"),
+
+    # Preserve the user's real HOME, XDG_CACHE_HOME (e.g. HuggingFace / model
+    # caches), and PIP_CACHE_DIR by default -- matching PyTorch. Sandboxing HOME
+    # into the per-project runtime is an explicit opt-in via local_home=True or
+    # JITTOR_TORCH_ISOLATE_HOME=1 (and JITTOR_TORCH_KEEP_HOME=1 always wins).
+    isolate_home = (
+        bool(local_home) or is_truthy(env.get("JITTOR_TORCH_ISOLATE_HOME"))
+    ) and not is_truthy(env.get("JITTOR_TORCH_KEEP_HOME"))
+
+    # Reuse a shared user-level JITTOR_HOME across working directories by default
+    # so changing cwd does not rebuild jittor_core from scratch; keep per-runtime
+    # isolation when the caller explicitly requested runtime/cache/home isolation.
+    isolate_jittor_home = bool(
+        explicit_runtime or env.get("JITTOR_TORCH_CACHE_ROOT") or isolate_home
+    )
+    default_jittor_home = (
+        runtime / "jittor_cache" if isolate_jittor_home else pathlib.Path(real_home)
+    )
+    _set_env_dir(env, "JITTOR_HOME", default_jittor_home)
+
+    # Share compiled JIT kernels across projects via the CAS shared cache when
+    # the user has not explicitly configured JITTOR_SHARED_CACHE (including "0").
+    if env.get("JITTOR_SHARED_CACHE") is None:
+        shared_cas = runtime.parent / "shared_cas"
+        _set_env_dir(env, "JITTOR_SHARED_CACHE", shared_cas)
+
+    shim_dirs = [
         ("TORCH_HOME", "torch_home"),
         ("JITTOR_TORCH_EXTENSIONS_DIR", "torch_extensions"),
         ("TORCH_EXTENSIONS_DIR", "torch_extensions"),
-        ("XDG_CACHE_HOME", "xdg_cache"),
         ("CUDA_CACHE_PATH", "cuda_cache"),
         ("TRITON_HOME", "triton_home"),
         ("TRITON_CACHE_DIR", "triton_home/cache"),
         ("TRITON_OVERRIDE_DIR", "triton_home/override"),
         ("TRITON_DUMP_DIR", "triton_home/dump"),
-        ("PIP_CACHE_DIR", "pip_cache"),
-    ):
+    ]
+    if isolate_home:
+        shim_dirs.extend([
+            ("XDG_CACHE_HOME", "xdg_cache"),
+            ("PIP_CACHE_DIR", "pip_cache"),
+        ])
+    for name, subdir in shim_dirs:
         _set_env_dir(env, name, runtime / subdir)
-    if local_home and not is_truthy(env.get("JITTOR_TORCH_KEEP_HOME")):
+    if isolate_home:
         env["HOME"] = env.get("JITTOR_TORCH_HOME", os.fspath(runtime / "home"))
         _ensure_dir(env["HOME"], "HOME for this process; "
                                 "JITTOR_TORCH_KEEP_HOME=1 keeps the real one")
@@ -539,7 +579,7 @@ def prepare_import_environment(
         env,
         "TMPDIR",
         _short_enough_tmpdir(runtime / "tmp"),
-        override=not is_truthy(env.get("JITTOR_TORCH_KEEP_TMPDIR")),
+        override=isolate_home and not is_truthy(env.get("JITTOR_TORCH_KEEP_TMPDIR")),
     )
     _prepare_kernel_math(env)
     jtcuda = _configure_cuda(env, real_home) if configure_cuda else None
