@@ -869,7 +869,11 @@ class TestTorchBootstrap(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=str(_TEST_STATE_ROOT)) as directory:
             environ = self._preflight_env(directory)
             prepare_import_environment(argv=["-c"], environ=environ)
-        self.assertEqual(environ["use_nccl"], "0")
+        self.assertEqual(environ["JT_BUILD_USE_NCCL"], "0")
+        self.assertEqual(environ["JT_BUILD_USE_MPI"], "0")
+        self.assertEqual(environ["JT_BUILD_USE_CUTT"], "0")
+        self.assertNotIn("use_nccl", environ)
+        self.assertNotIn("use_cutt", environ)
 
     def test_a_rank_of_a_multi_rank_job_turns_nccl_on(self):
         from jittor.compat.shim.preflight import prepare_import_environment
@@ -877,12 +881,13 @@ class TestTorchBootstrap(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=str(_TEST_STATE_ROOT)) as directory:
             environ = self._preflight_env(directory, OMPI_COMM_WORLD_SIZE="2")
             prepare_import_environment(argv=["-c"], environ=environ)
-        self.assertEqual(environ["use_nccl"], "1")
+        self.assertEqual(environ["JT_BUILD_USE_NCCL"], "1")
+        self.assertEqual(environ["JT_BUILD_USE_MPI"], "1")
 
     def test_a_ranks_nccl_is_not_decided_by_the_process_that_launched_it(self):
         # preflight runs on every `import jittor`, writes into os.environ, and
         # os.environ is inherited. A single-rank launcher (a pytest session,
-        # say) that defaults use_nccl=0 for itself used to hand its mpirun
+        # say) that defaults JT_BUILD_USE_NCCL=0 for itself used to hand its mpirun
         # ranks an *explicit* "0", so a setdefault in the rank was a no-op and
         # every FSDP2 shard gather failed -- switched off by a process that was
         # not part of the job.
@@ -891,16 +896,18 @@ class TestTorchBootstrap(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=str(_TEST_STATE_ROOT)) as directory:
             launcher = self._preflight_env(directory)
             prepare_import_environment(argv=["-c"], environ=launcher)
-            self.assertEqual(launcher["use_nccl"], "0")
+            self.assertEqual(launcher["JT_BUILD_USE_NCCL"], "0")
+            self.assertEqual(launcher["JT_BUILD_USE_MPI"], "0")
 
             rank = dict(launcher)          # exactly what the child inherits
             rank["OMPI_COMM_WORLD_SIZE"] = "2"
             prepare_import_environment(argv=["-c"], environ=rank)
-        self.assertEqual(rank["use_nccl"], "1")
+        self.assertEqual(rank["JT_BUILD_USE_NCCL"], "1")
+        self.assertEqual(rank["JT_BUILD_USE_MPI"], "1")
 
     def test_an_explicit_use_nccl_is_never_overruled(self):
         # The marker says "preflight wrote this"; a value the user set carries
-        # none, so neither direction may be reconsidered.
+        # none, so neither direction may be reconsidered (canonical or legacy).
         from jittor.compat.shim.preflight import prepare_import_environment
 
         with tempfile.TemporaryDirectory(dir=str(_TEST_STATE_ROOT)) as directory:
@@ -908,10 +915,11 @@ class TestTorchBootstrap(unittest.TestCase):
                                       OMPI_COMM_WORLD_SIZE="2")
             prepare_import_environment(argv=["-c"], environ=off)
             self.assertEqual(off["use_nccl"], "0")
+            self.assertNotIn("JT_BUILD_USE_NCCL", off)
 
-            on = self._preflight_env(directory, use_nccl="1")
+            on = self._preflight_env(directory, JT_BUILD_USE_NCCL="1")
             prepare_import_environment(argv=["-c"], environ=on)
-        self.assertEqual(on["use_nccl"], "1")
+        self.assertEqual(on["JT_BUILD_USE_NCCL"], "1")
 
     def test_a_rank_variable_is_not_read_as_a_world_size(self):
         # PMIX_RANK is set by every PMIx launcher including `mpirun -np 1`, and
@@ -923,7 +931,58 @@ class TestTorchBootstrap(unittest.TestCase):
             environ = self._preflight_env(directory, PMIX_RANK="0",
                                           OMPI_COMM_WORLD_SIZE="1")
             prepare_import_environment(argv=["-c"], environ=environ)
-        self.assertEqual(environ["use_nccl"], "0")
+        self.assertEqual(environ["JT_BUILD_USE_NCCL"], "0")
+        self.assertEqual(environ["JT_BUILD_USE_MPI"], "0")
+
+    def test_preflight_zero_env_defaults_preserve_user_home_and_multiprocessing(self):
+        from jittor.compat.shim.preflight import prepare_import_environment
+
+        with tempfile.TemporaryDirectory(dir=str(_TEST_STATE_ROOT)) as directory:
+            user_home = pathlib.Path(directory) / "real_home"
+            user_xdg = pathlib.Path(directory) / "real_xdg"
+            user_pip = pathlib.Path(directory) / "real_pip"
+            user_tmp = pathlib.Path(directory) / "real_tmp"
+            for p in (user_home, user_xdg, user_pip, user_tmp):
+                p.mkdir()
+            environ = {
+                "HOME": os.fspath(user_home),
+                "XDG_CACHE_HOME": os.fspath(user_xdg),
+                "PIP_CACHE_DIR": os.fspath(user_pip),
+                "TMPDIR": os.fspath(user_tmp),
+                "JITTOR_TORCH_SHIM": "1",
+                "JITTOR_TORCH_KEEP_CUDA": "1",
+            }
+            result = prepare_import_environment(argv=["-c"], environ=environ)
+            self.assertTrue(result.active)
+            # HOME, XDG_CACHE_HOME, PIP_CACHE_DIR, TMPDIR stay untouched by default
+            self.assertEqual(environ["HOME"], os.fspath(user_home))
+            self.assertEqual(environ["XDG_CACHE_HOME"], os.fspath(user_xdg))
+            self.assertEqual(environ["PIP_CACHE_DIR"], os.fspath(user_pip))
+            self.assertEqual(environ["TMPDIR"], os.fspath(user_tmp))
+            # JITTOR_HOME reuses user home across projects and enables CAS shared cache
+            self.assertEqual(environ["JITTOR_HOME"], os.fspath(user_home))
+            self.assertTrue(environ.get("JITTOR_SHARED_CACHE", "").endswith("shared_cas"))
+            # Multiprocessing is NOT force-disabled for ordinary user runs
+            self.assertNotIn("DISABLE_MULTIPROCESSING", environ)
+
+            # Explicit opt-in still isolates HOME when requested
+            isolated = {
+                "HOME": os.fspath(user_home),
+                "JITTOR_TORCH_SHIM": "1",
+                "JITTOR_TORCH_ISOLATE_HOME": "1",
+                "JITTOR_TORCH_KEEP_CUDA": "1",
+            }
+            prepare_import_environment(argv=["-c"], environ=isolated)
+            self.assertNotEqual(isolated["HOME"], os.fspath(user_home))
+            self.assertTrue(isolated["JITTOR_HOME"].endswith("jittor_cache"))
+
+    def test_activate_defaults_do_not_build_extensions_on_import(self):
+        import inspect
+        from jittor.compat.shim.runtime import activate
+
+        sig = inspect.signature(activate)
+        self.assertIs(sig.parameters["build_extensions"].default, False)
+        self.assertIs(sig.parameters["local_home"].default, False)
 
     def test_shim_environment_trigger_is_reported_as_environment(self):
         from jittor.compat.shim.preflight import prepare_import_environment

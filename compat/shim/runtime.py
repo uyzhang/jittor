@@ -159,9 +159,9 @@ def _activate_once(
     import_paths: Optional[Sequence[Union[str, os.PathLike]]] = None,
     extension_dirs: Optional[Sequence[Union[NativeExtension, str, os.PathLike]]] = None,
     auto_scan_extensions: bool = True,
-    build_extensions: bool = True,
+    build_extensions: bool = False,
     max_scan_depth: int = 5,
-    local_home: bool = True,
+    local_home: bool = False,
     configure_cuda: bool = True,
     inference: bool = False,
     verbose: Optional[bool] = None,
@@ -365,7 +365,10 @@ def _activate_once(
 
     built: List[str] = []
     skip_build = is_truthy(os.environ.get("JITTOR_TORCH_SKIP_EXT_BUILD"))
-    if build_extensions and not skip_build:
+    auto_build = bool(build_extensions) or is_truthy(
+        os.environ.get("JITTOR_TORCH_AUTO_BUILD_EXT")
+    )
+    if auto_build and not skip_build:
         buildable = [ext for ext in scanned if ext.setup_py]
         if buildable:
             built = build_extension_dirs(
@@ -417,9 +420,9 @@ def activate(
     import_paths: Optional[Sequence[Union[str, os.PathLike]]] = None,
     extension_dirs: Optional[Sequence[Union[NativeExtension, str, os.PathLike]]] = None,
     auto_scan_extensions: bool = True,
-    build_extensions: bool = True,
+    build_extensions: bool = False,
     max_scan_depth: int = 5,
-    local_home: bool = True,
+    local_home: bool = False,
     configure_cuda: bool = True,
     inference: bool = False,
     verbose: Optional[bool] = None,
